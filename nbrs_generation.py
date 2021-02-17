@@ -54,7 +54,7 @@ def las_reader(fpath, classes = (2, 26)):
     with File(fpath, mode = "r") as in_file:
         in_np = np.vstack((in_file.raw_classification,
                            in_file.x, in_file.y, in_file.z)).transpose()
-        header = in_file.header
+        header = in_file.header.copy()
     return in_np[np.isin(in_np[:,0], classes)], header
 
 def las_writer(fpath, header, pts):
@@ -72,8 +72,8 @@ def las_writer(fpath, header, pts):
         out_file.x = pts[:,0]
         out_file.y = pts[:,1]
         out_file.z = pts[:,2]
-        out_file.NBRS_ID = pts[:,3]
-        out_file.ORIGIN = pts[:,4]
+        out_file.ORIGIN = pts[:,3].astype(int)
+        out_file.NBRS_ID = pts[:,4].astype(int)
 
 def planefit_lsq(vxs):
     """Function to perform least-squares planin fitting on the
@@ -173,7 +173,7 @@ class nbrs_manager:
         nwb['geometry_type'] = nwb['geometry'].apply(get_geom_type)
         nwb = nwb[nwb['geometry_type'] == 'LineString']
         self.nwb = nwb.drop(['geometry_type'], 1)
-        self.nbrs, self.jte, self.subclouds = {}, {}, np.array([])
+        self.nbrs, self.jte, self.nbrs_subclouds = {}, {}, {}
         self.geoms = dict(zip(self.nwb['WVK_ID'],
                               self.nwb['geometry']))
         self.origins = dict(zip(self.nwb['WVK_ID'],
@@ -287,10 +287,13 @@ class nbrs_manager:
     def write_subclouds(self, fpath):
         """Writes all the subclouds that were generated.
         """
-        if not len(self.subclouds) > 0:
+        if not self.nbrs_subclouds:
             print('ERROR: Subclouds have not been generated yet.')
             return
-        las_writer(fpath, self.las_header, self.subclouds)
+        subclouds = []
+        for key, item in self.nbrs_subclouds.items():
+            subclouds.append(np.c_[item, np.full(len(item), key)])
+        las_writer(fpath, self.las_header, np.concatenate(subclouds))
     
     def generate_nbrs(self, algorithm = 'geometric'):
         """Starts either NBRS generation algorithm. For the
@@ -793,7 +796,7 @@ class nbrs_manager:
         # perform the aggregated NBRS-AHN3 query
         nbrs_ix = nbrs_tree.query_ball_tree(lidar_tree, r)
         print('SEGMENTING POINT CLOUD')
-        subclouds, first = [], 0
+        first = 0
         for nbrs_id in self.get_ids():
             nbrs_vxnos = self.nbrs_vxnos[nbrs_id]
             last = first + sum(nbrs_vxnos)
@@ -906,21 +909,16 @@ class nbrs_manager:
                 for pt in lclose: subcloud.add(tuple(pt))
             # compile NBRS's subcloud from the pre-selected AHN3 and
             # DTB points added in previous steps - each point may only
-            # be added once per NBRS
+            # be added once *per NBRS*
             if subcloud:
-                subclouds.append(np.c_[np.array(list(subcloud)),
-                                 np.full(len(subcloud), nbrs_id),
-                                 np.full(len(subcloud), 0)])
+                subcloud = np.c_[np.array(list(subcloud)),
+                                 np.full(len(subcloud), 0)]
             if subcloud_dtb:
-                subclouds.append(np.c_[np.array(list(subcloud_dtb)),
-                                 np.full(len(subcloud_dtb), nbrs_id),
-                                 np.full(len(subcloud_dtb), 1)])
+                subcloud_dtb = np.c_[np.array(list(subcloud_dtb)),
+                                     np.full(len(subcloud_dtb), 1)]
+                subcloud = np.concatenate((subcloud, subcloud_dtb))
+            self.nbrs_subclouds[nbrs_id] = subcloud
             first = last
-        # merge all subclouds into a single array so that they can
-        # be written into a LAS file easily - AHN3 and DTB points
-        # may be repeated in this array, but are semantically marked
-        # to be part of different NBRS
-        self.subclouds = np.concatenate(subclouds)
         print('FINISHED POINT CLOUD SEGMENTATION')
 
 # testing configuration, only runs when script is not imported
