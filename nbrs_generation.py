@@ -4,6 +4,7 @@
 ##    K.Kenesei@student.tudelft.nl     ##
 #########################################
 
+
 import numpy as np
 import geopandas as gpd
 from shapely.geometry import MultiPoint, LineString, MultiLineString
@@ -11,6 +12,7 @@ from shapely import ops
 from scipy.spatial import cKDTree
 from laspy.file import File
 import matplotlib
+
 
 def conv_tovx(lstr):
     """Converts the input shapely LineString to a shapely
@@ -36,7 +38,7 @@ def get_geom_type(lstr):
     return lstr.geom_type
 
 def calc_angle(jt, end0, end1):
-    """Computes the angle between two 2D vectors that share a
+    """Computes the angle between two vectors that share a
     starting vertex "jt". It is used when determining which
     wegvak to continue on when an intersection is reached in
     the NBRS-generation algorithms.
@@ -76,7 +78,7 @@ def las_writer(fpath, header, pts):
         out_file.NBRS_ID = pts[:,4].astype(int)
 
 def planefit_lsq(vxs):
-    """Function to perform least-squares planin fitting on the
+    """Function to perform least-squares plane fitting on the
     input points of format (x, y, z). The fitted plane is
     returned as the 'd' parameter of the plane equation and
     a normal vector of the plane.
@@ -106,19 +108,82 @@ def dist_toplane(pt, d, normal):
     den = np.sqrt(normal[0]**2 + normal[1]**2 + normal[2]**2)
     return abs(nom / den)
 
-def filter_outliers(vxs):
-    """ Performs 1D-smoothing on a series of input
-    vertices that form a 3D line. Fits a quartic
-    polynomial to obtain a model, and uses the data-
-    model errors to identify outliers. It then uses
-    numpy interpolation to find better values at
-    these locations, and locations where the elevation
-    was missing originally. Edits the input in-place.
+def orientation(vx0, vx1, pt):
+    """Function to perform an Orientation test.
+    
+    Takes three points.
+    The Orientation test is relative to the last parameter point.
+    
+    Returns the Orientation test result in the following format:
+    -1 -- Point is clockwise from the line.
+    0  -- Point is collinear with the line.
+    1  -- Point is counter-clockwise from the line.
     """
-    zs = vxs[:,2]
-    # zero out the entire NBRS if it has too many NaNs
-    if len(zs[np.isnan(zs)]) / len(zs) > 0.75:
-        vxs[:,2] = np.full(len(zs), np.NaN); return
+    A = np.array([[vx0[0], vx0[1], 1],
+                  [vx1[0], vx1[1], 1],
+                  [pt[0], pt[1], 1]])
+    det = np.linalg.det(A)
+    if det < 0: return -1
+    if det > 0: return 1
+    return 0
+
+def get_cross(vx0, vx1, vx2, len_cross, sense):
+    """Function to return a "cross-section" at the shared
+    vertex of two connected edges. The cross-section will
+    have the mean slope of the two edges. Its length should
+    be provided as a parameter. The "sense" parameter
+    specifies which side of the edges should serve as a
+    reference for the orientation of the cross-section.
+    A workaround for vertical edges is included. The
+    function is void for edges with inconsistent slope
+    signs, as handling these would introduce an unnecessary
+    amount of complexity into the code.
+    """
+    if vx1[0] == vx0[0]: vx1[0] += 0.00001
+    slope = (vx1[1] - vx0[1]) / (vx1[0] - vx0[0])
+    # if the second edge does not exist, the cross section is
+    # still constructed based on the one existing edge
+    if vx2:
+        if vx2[0] == vx1[0]: vx2[0] += 0.00001
+        slope1 = (vx2[1] - vx1[1]) / (vx2[0] - vx1[0])
+        if np.sign(slope) != np.sign(slope1): return
+        len0, len1 = dist_topoint(vx0, vx1), dist_topoint(vx0, vx1)
+        slope = (slope * len0 + slope1 * len1) / (len0 + len1)
+    dy = np.sqrt((len_cross / 2)**2 / (slope**2 + 1))
+    dx = -slope * dy
+    cross = ((vx1[0] + dx, vx1[1] + dy),
+             (vx1[0] - dx, vx1[1] - dy))
+    # orientation test ensures that output cross-sections
+    # are always constructed with the right orientation,
+    # so that they can be used to construct road "curbs"
+    if orientation(vx0, vx1, cross[0]) != sense: return cross[::-1]
+    return cross
+
+def filter_outliers(vxs, degree = 5, only_detect = False,
+                    thres = 1, prox = None):
+    """ Performs 1D-smoothing (or alternatively, just outlier
+    detection) on a series of input points that form a 3D line.
+    Fits a polynomial f the desired degree to obtain a model,
+    and uses the data-model errors to identify outliers.
+    If smoothing is desired, it uses numpy interpolation to find
+    better values at the locations of outliers, and at locations
+    where elevation was missing originally. Edits the input in-place.
+    The parameter "thres" configures the outlier detection
+    threshold as the number of standard deviations where the cutoff
+    should occur. The parameter "prox" is for internal purposes,
+    it allows the fitting to take place only on a certain
+    percentage of the input points centred around the middle.
+    """
+    zs = vxs[:,2].copy()
+    if prox:
+        mid, cut = len(zs) // 2, round(len(zs) * prox // 2)
+        zs[:mid - cut] = np.NaN; zs[mid + cut + 1:] = np.NaN
+    if ((not prox and len(zs[np.isnan(zs)]) / len(zs) > 0.75)
+        or (prox and len(zs[~np.isnan(zs)]) < degree + 1)):
+        if only_detect == False:
+            # zero out the entire NBRS if it has too many NaNs
+            vxs[:,2] = np.full(len(zs), np.NaN)
+        return
     # find model polynomial and compute model values
     # exclude locations where the elevation is missing
     diffs = np.insert(np.diff(vxs[:,:2], axis = 0), 0, 0, axis = 0)
@@ -129,18 +194,19 @@ def filter_outliers(vxs):
     coeffs = np.polynomial.polynomial.polyfit(dsts_notnan, zs_notnan, 4)
     model_zs = np.polynomial.polynomial.polyval(dsts, coeffs)
     # compute the data-model errors and STD
-    error = np.abs(zs - model_zs)
+    error = np.abs(vxs[:,2] - model_zs)
     std = np.std(error[~np.isnan(error)])
-    # if STD is tiny, increase it artificially - we do not
-    # wish to modify meaningful elevations just because
-    # they are very slightly off relative to the model
     if std < 0.4: std = 0.4
+    # do not perform smoothing if only filtering is desired
+    if only_detect: return error > thres * std
     # create an index of vertices where the elevation is
     # either missing, or was identified as an outlier
-    out_ix = (error > std) | np.isnan(error)
+    out_ix = (error > thres) | np.isnan(error)
     # if any were found, replace them with interpolated values
     if len(out_ix) > 0:
         zs[out_ix] = np.interp(dsts[out_ix], dsts[~out_ix], zs[~out_ix])
+        vxs[:,2] = zs
+
 
 class nbrs_manager:
     
@@ -164,8 +230,24 @@ class nbrs_manager:
                to perform point cloud segmentation (pre-
                selection of AHN3 points that fall on the road
                surfaces belonging to specific NBRS).
+               Post-segmentation, the sublocuds can be found
+               in .nbrs_subclouds, which needs to be indexed
+               with an NBRS ID to return a subcloud.
             7. Optionally, write to segmented point cloud to
                disk as a LAS file by invoking .write_subclouds().
+            8. Invoke .estimate_edges() to construct crude edge
+               estimates. Currently, both the edge estimates
+               and the cross-sections are stored as NBRS-level
+               geometries in .nbrs_edges and .nbrs_crosses,
+               which need to be indexed with an NBRS ID to
+               return edges/cross-sections.
+            9. Optionally, write the edges and cross-sections
+               to disk by invoking .write_edges().
+        NOTE: the edges and cross-sections are stored as 3D
+            geometries. This is for reference purposes only, as
+            their planned use is to provide initial road edge
+            estimates for the upcoming active contour optimisation
+            feature, which is an intrinsically 2D procedure.
         Example calls are provided at the end of this script.
         """
         nwb = gpd.read_file(fpath); nwb['NBRS_ID'] = None
@@ -180,6 +262,7 @@ class nbrs_manager:
                                 self.nwb['geometry'].apply(make_geom_idcol)))
         self.wvk_count, self.nbrs_count = len(self.nwb.index), 0
         self.nbrs_ids, self.nbrs_geoms, self.nbrs_revs = {}, {}, {}
+        self.nbrs_edges, self.nbrs_crosses = [], []
     
     def is_empty(self):
         """Return True if NBRS have been generated,
@@ -294,6 +377,17 @@ class nbrs_manager:
         for key, item in self.nbrs_subclouds.items():
             subclouds.append(np.c_[item, np.full(len(item), key)])
         las_writer(fpath, self.las_header, np.concatenate(subclouds))
+        
+    def write_edges(self, fpath_edges, fpath_crosses):
+        """Writes the crude edges (and cross-sections) that were
+        generated. A file path for both the edges and the cross-
+        sections needs to be provided.
+        """
+        if len(self.nbrs_edges) == 0:
+            print('ERROR: Edges have not been generated yet.')
+            return
+        self.nbrs_edges.to_file(fpath_edges)
+        self.nbrs_crosses.to_file(fpath_crosses)
     
     def generate_nbrs(self, algorithm = 'geometric'):
         """Starts either NBRS generation algorithm. For the
@@ -607,7 +701,7 @@ class nbrs_manager:
         dst = dist_topoint(edge[0], edge[1])
         # if distance threshold is not respected: split
         if dst > thres:
-            pt = np.mean(edge, axis = 0)
+            pt = tuple(np.mean(edge, axis = 0))
             edge_0, edge_1 = (edge[0], pt), (pt, edge[1])
             # recursively split first half and second half
             edge_0 = self._densify_edge(edge_0, thres)
@@ -625,7 +719,7 @@ class nbrs_manager:
         # import and subsample Lidar
         print('IMPORTING AHN3 TILE')
         self.ahn3, self.las_header = las_reader(fpath)
-        self.ahn3 = self.ahn3[::5]
+        self.ahn3 = self.ahn3[::3]
         # build a list of all NBRS vertex counts and vertices -
         # per-NBRS lists are needed for smoothing, and a
         # completely flat list of all vertices is needed
@@ -715,7 +809,7 @@ class nbrs_manager:
             nbrs_vxs_z = np.c_[nbrs_vxs, zs]
             # apply the elevation smoothing algorithm
             # to the 3D coordinate array
-            if len(nbrs_vxnos) != 1: filter_outliers(nbrs_vxs_z)
+            filter_outliers(nbrs_vxs_z)
             # re-assemble the smoothed 3D coordinate arrays
             # into wegvak geometries and set the active wegvak
             # geometries of the class to these new geometries, and
@@ -843,6 +937,7 @@ class nbrs_manager:
                         dz = abs(1 - med_z / prev_med_z)
                     # if instability in the plane fitting is supected,
                     # flag for assist
+                    #if nbrs_id == 2: print(vx, std, dz, dp)
                     need_assist = std > 0.1 * r or (dz > 0.5 or dp > 0.5)
                 if need_assist:
                     pts = np.array([])
@@ -877,7 +972,7 @@ class nbrs_manager:
                         # this is necessary because DTB is not always
                         # perfectly conformant with the AHN3-defined
                         # road surface, I have observed up to 1-1.5 m
-                        # deviations, e.g. before Prins Clausplein
+                        # deviations, e.g. at the Knoppunt Ridderkerk
                         if len(lclose) > 20:
                             plane = planefit_lsq(lclose)
                             prev_med_z = np.median(lclose[:,2])
@@ -911,8 +1006,22 @@ class nbrs_manager:
             # DTB points added in previous steps - each point may only
             # be added once *per NBRS*
             if subcloud:
-                subcloud = np.c_[np.array(list(subcloud)),
-                                 np.full(len(subcloud), 0)]
+                # perform a quick outlier filtering on the subcloud
+                subcloud = np.array(list(subcloud))
+                subcloud_tree = cKDTree(subcloud)
+                subcloud_tree_len = subcloud_tree.n
+                _, ixs = subcloud_tree.query(subcloud, 3,
+                                             distance_upper_bound = 0.8,
+                                             workers = -1)
+                subcloud_mask = []
+                for pt_ixs in ixs:
+                    if len(pt_ixs[pt_ixs != subcloud_tree_len]) == 3:
+                        subcloud_mask += [True]
+                    else:
+                        subcloud_mask += [False]
+                subcloud = subcloud[subcloud_mask]
+                subcloud = np.c_[subcloud, np.full(len(subcloud), 0)]
+            else: subcloud = np.empty((0, 4))
             if subcloud_dtb:
                 subcloud_dtb = np.c_[np.array(list(subcloud_dtb)),
                                      np.full(len(subcloud_dtb), 1)]
@@ -920,14 +1029,140 @@ class nbrs_manager:
             self.nbrs_subclouds[nbrs_id] = subcloud
             first = last
         print('FINISHED POINT CLOUD SEGMENTATION')
+        
+    def estimate_edges(self):
+        """Method to construct crude preliminary edges estimates
+        based on NBRS's NWB locations and subclouds. Cross-sections
+        are constructed in NWB vertices (and densified vertices) and
+        the elevations of nearby subcloud points are used to
+        transpose them into 3D (they are first densified to enable
+        better point cloud sampling). Line fitting is then used to
+        identify an edge point on both side of NWB in each cross-
+        section. The first conformant point is chosen from the
+        ends of the cross-sections, progressing inwards (towards
+        NWB). If no such point could be found, the first cross-
+        section point (again, progressing inwards) with an existing
+        elevation is picked. In the absence of such a point, the
+        cross-section is "deleted".
+        """
+        print('\nSTARTING PRELIMINARY ROAD EDGE ESTIMATION')
+        edgegeoms_l, edgegeoms_r, crossgeoms, first = [], [], [], 0
+        for nbrs_id in self.get_ids():
+            # gather necessary NBRS NWB and subcloud data
+            nbrs_vxnos = self.nbrs_vxnos[nbrs_id]
+            last = first + sum(nbrs_vxnos)
+            nbrs_vxs = self.flat_vxs[first:last]
+            subcloud = self.nbrs_subclouds[nbrs_id]
+            # special case: NBRS has empty subcloud
+            if len(subcloud) == 0:
+                edgegeoms_l += [LineString()]
+                edgegeoms_r += [LineString()]
+                crossgeoms += [MultiLineString()]
+                first = last
+                continue
+            # build 2D KD-tree from subcloud and create hashed
+            # link to the elevations of the tree's points
+            lidar_tree = cKDTree(subcloud[:,:2])
+            lidar_tree_len = lidar_tree.n
+            xy = [tuple(arr) for arr in subcloud[:,:2]]
+            link = dict(zip(xy, subcloud[:,2]))
+            # generate the cross-sections
+            vx0, vx1 = nbrs_vxs[0][:2], nbrs_vxs[1][:2]
+            # special case: cross-section on first NBRS vertex
+            cross_edges = [get_cross(vx1, vx0, None, self.thres, 1)]
+            # general case
+            for vx2 in nbrs_vxs[2:]:
+                cross_edges.append(get_cross(vx0, vx1, vx2[:2],
+                                             self.thres, -1))
+                vx0, vx1 = vx1, vx2[:2]
+            # special case: cross-section on last NBRS vertex
+            cross_edges.append(get_cross(vx0, vx1, None,
+                                         self.thres, -1))
+            # densify the cross-sections
+            cross_edges = [self._densify_edge(edge, 0.3)
+                           for edge in cross_edges
+                           if edge is not None]
+            cross_vxs = np.concatenate(cross_edges)
+            # fetch the Lidar points necessary to transpose
+            # the cross-sections into 3D
+            _, ixs = lidar_tree.query(cross_vxs, 10,
+                                      distance_upper_bound = 0.2,
+                                      workers = -1)
+            # transpose each (densified) cross-section vertex
+            # into 3D using the median of the elevations of
+            # the selected close-by subcloud points
+            cross_zs = []
+            for pt_ixs in ixs:
+                pt_xy = [xy[ix] if ix != lidar_tree_len
+                         else (None, None) for ix in pt_ixs]
+                pt_zs = [link[pt] if None not in pt
+                         else None for pt in pt_xy]
+                pt_zs = np.array(pt_zs, dtype = float)
+                pt_zs = pt_zs[~np.isnan(pt_zs)]
+                if len(pt_zs) == 0: cross_zs.append(None)
+                else: cross_zs.append(np.median(pt_zs))
+            cross_vxs = np.array(np.c_[cross_vxs, cross_zs], dtype = float)
+            # estimate crude edge locations
+            mid = len(cross_edges[0]) // 2
+            edges_l, edges_r, crosses = [], [], []
+            for vxs in np.split(cross_vxs, len(cross_edges)):
+                outliers = filter_outliers(vxs, 1, True, 1, 0.15)
+                if outliers is None: continue
+                missing = np.isnan(vxs[:,2])
+                edge_l, edge_r = None, None
+                # try looking for the first valid cross-section
+                # vertex (one with a non-outlier elevation),
+                # progressing inwards
+                for i in range(mid):
+                    if not outliers[i] and not missing[i]:
+                        edge_l = list(vxs[i]); break
+                for i in range(1, mid + 1):
+                    if not outliers[-i] and not missing[-i]:
+                        edge_r = list(vxs[-i]); break
+                # if insuccesful, try just getting the first one
+                # that has an elevation
+                if not edge_l:
+                    for i in range(mid):
+                        if not missing[i]:
+                            edge_l = list(vxs[i]); break
+                if not edge_r:
+                    for i in range(1, mid + 1):
+                        if not missing[-i]:
+                            edge_r = list(vxs[-i]); break
+                # if an edge point could be found on both sides
+                # of the NWB, then extend the road edge with
+                # them, and construct the cross-section geometry
+                if edge_l and edge_r:
+                    if not dist_topoint(edge_l, edge_r) < 2:
+                        edges_l.append(edge_l)
+                        edges_r.append(edge_r)
+                        crosses += [LineString((edge_l, edge_r))]
+            # construct the NBRS's edge and cross-section geometries
+            edgegeoms_l += [LineString(edges_l)]
+            edgegeoms_r += [LineString(edges_r)]
+            crossgeoms += [MultiLineString(crosses)]
+            first = last
+        
+        # create GeoDataFrames with all the resulting road
+        # edge and cross-section geometries
+        sides = ['left'] * self.nbrs_count + ['right'] * self.nbrs_count
+        edge_dict = {'NBRS_ID': self.get_ids() + self.get_ids(),
+                     'SIDE': sides, 'geometry': edgegeoms_l + edgegeoms_r}
+        cross_dict = {'NBRS_ID': self.get_ids(), 'geometry': crossgeoms}
+        self.nbrs_edges = gpd.GeoDataFrame(edge_dict, crs="EPSG:28992")
+        self.nbrs_crosses = gpd.GeoDataFrame(cross_dict, crs="EPSG:28992")
+        print('\nFINISHED PRELIMINARY ROAD EDGE ESTIMATION')
+        
 
 # testing configuration, only runs when script is not imported
 if __name__ == '__main__':
-    nwb_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_nwb.shp'
+    nwb_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_nwb_2.shp'
     dtb_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_dtb.shp'
     ahn_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_2_26_clipped.las'
     simpleZ_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_simpleZ.shp'
     subclouds_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_subclouds.las'
+    edges_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_edges.shp'
+    crosses_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_crosses.shp'
     roads = nbrs_manager(nwb_fpath)
     roads.generate_nbrs()
     roads.densify(10)
@@ -935,5 +1170,7 @@ if __name__ == '__main__':
     roads.write_all(simpleZ_fpath)
     roads.segment_lidar(dtb_fpath)
     roads.write_subclouds(subclouds_fpath)
+    roads.estimate_edges()
+    roads.write_edges(edges_fpath, crosses_fpath)
     #roads.plot(1, True)
-    roads.plot_all()
+    #roads.plot_all()
