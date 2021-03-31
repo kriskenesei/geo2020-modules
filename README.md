@@ -16,4 +16,4 @@ Note that some wegvakken/NBRS in the output may have all-NaN elevations and empt
 
 My focus will now shift to producing the P4 report and working on the accuracy assessment part of the project. It is possible that I will implement some of the accuracy assessment workflows in the `nbrs_manager` class, in which case I will update the repository once more to release these features too.
 
-![Screenshot of preliminary edges in C_37HN2](readme_thumb.png?raw=true "Screenshot of preliminary edges in C_37HN2")
+![Screenshot of preliminary edges and cross-sections in C_37HN2](readme_thumb.png?raw=true "Screenshot of preliminary edges and cross-sections in C_37HN2")
