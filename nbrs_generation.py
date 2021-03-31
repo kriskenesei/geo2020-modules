@@ -7,11 +7,13 @@
 
 import numpy as np
 import geopandas as gpd
-from shapely.geometry import MultiPoint, LineString, MultiLineString
+from shapely.geometry import MultiPoint, LineString, MultiLineString, Polygon
 from shapely import ops
 from scipy.spatial import cKDTree
-from laspy.file import File
-import matplotlib
+from skimage.segmentation import active_contour
+import matplotlib as mpl
+import lib_shared
+import startin
 
 
 def conv_tovx(lstr):
@@ -23,10 +25,9 @@ def conv_tovx(lstr):
 
 def make_geom_idcol(lstr):
     """Returns a list containing the string 'nbw' as many times
-    as the input LineString has vertices. This is used to create
+    as the input LineString has vertices. This is used to initialise
     a column in the NWB GeoDataFrame where the software can
-    indicate what the source each the vertex is (i.e. NWB
-    or densification).
+    indicate what the source each the vertex is.
     """
     return list(np.full(len(lstr.coords), 'nwb'))
 
@@ -37,176 +38,6 @@ def get_geom_type(lstr):
     """
     return lstr.geom_type
 
-def calc_angle(jt, end0, end1):
-    """Computes the angle between two vectors that share a
-    starting vertex "jt". It is used when determining which
-    wegvak to continue on when an intersection is reached in
-    the NBRS-generation algorithms.
-    """
-    v0 = np.array(end0) - np.array(jt)
-    v1 = np.array(end1) - np.array(jt)
-    v0, v1 = v0 / np.linalg.norm(v0), v1 / np.linalg.norm(v1)
-    return np.arccos(np.dot(v0, v1))
-
-def las_reader(fpath, classes = (2, 26)):
-    """ Loads the AHN3 tile at the provided file path,
-    and returns the 3D coordinates of the points with
-    the specified classes as a numpy array.
-    """
-    with File(fpath, mode = "r") as in_file:
-        in_np = np.vstack((in_file.raw_classification,
-                           in_file.x, in_file.y, in_file.z)).transpose()
-        header = in_file.header.copy()
-    return in_np[np.isin(in_np[:,0], classes)], header
-
-def las_writer(fpath, header, pts):
-    """Writes the input points of format (x, y, z,
-    NBRS_ID, ORIGIN) to disk in the LAS format, using
-    the provided header (preferably that of the input).
-    This is used to write the segmented point cloud to disk,
-    to visualise the intermediate results.
-    """
-    with File(fpath, mode="w", header=header) as out_file:
-        out_file.define_new_dimension(name = "NBRS_ID", data_type = 3,
-                                      description = 'NBRS_ID')
-        out_file.define_new_dimension(name = "ORIGIN", data_type = 3,
-                                      description = 'ORIGIN')
-        out_file.x = pts[:,0]
-        out_file.y = pts[:,1]
-        out_file.z = pts[:,2]
-        out_file.ORIGIN = pts[:,3].astype(int)
-        out_file.NBRS_ID = pts[:,4].astype(int)
-
-def planefit_lsq(vxs):
-    """Function to perform least-squares plane fitting on the
-    input points of format (x, y, z). The fitted plane is
-    returned as the 'd' parameter of the plane equation and
-    a normal vector of the plane.
-    """
-    A = np.c_[vxs[:,:2], np.full(len(vxs), 1)]
-    (a, b, c) = np.linalg.lstsq(A, vxs[:,2], rcond = None)[0]
-    normal = (a, b, -1) / np.linalg.norm((a, b, -1))
-    d = -np.array([0.0, 0.0, c]).dot(normal)
-    return d, normal
-
-def dist_topoint(pt, other_pt):
-    """Returns the 2D or 3D distance of two points, depending
-    on the dimensionality of the input points.
-    """
-    if len(pt) == 2: return np.sqrt((pt[0] - other_pt[0]) ** 2 +
-                                    (pt[1] - other_pt[1]) ** 2)
-    return np.sqrt((pt[0] - other_pt[0]) ** 2 +
-                   (pt[1] - other_pt[1]) ** 2 +
-                   (pt[2] - other_pt[2]) ** 2)
-
-def dist_toplane(pt, d, normal):
-    """Returns the distance of a point to a plane represented
-    by the 'd' parameter of the plane equation, and a normal
-    of the plane.
-    """
-    nom = normal[0] * pt[0] + normal[1] * pt[1] + normal[2] * pt[2] + d
-    den = np.sqrt(normal[0]**2 + normal[1]**2 + normal[2]**2)
-    return abs(nom / den)
-
-def orientation(vx0, vx1, pt):
-    """Function to perform an Orientation test.
-    
-    Takes three points.
-    The Orientation test is relative to the last parameter point.
-    
-    Returns the Orientation test result in the following format:
-    -1 -- Point is clockwise from the line.
-    0  -- Point is collinear with the line.
-    1  -- Point is counter-clockwise from the line.
-    """
-    A = np.array([[vx0[0], vx0[1], 1],
-                  [vx1[0], vx1[1], 1],
-                  [pt[0], pt[1], 1]])
-    det = np.linalg.det(A)
-    if det < 0: return -1
-    if det > 0: return 1
-    return 0
-
-def get_cross(vx0, vx1, vx2, len_cross, sense):
-    """Function to return a "cross-section" at the shared
-    vertex of two connected edges. The cross-section will
-    have the mean slope of the two edges. Its length should
-    be provided as a parameter. The "sense" parameter
-    specifies which side of the edges should serve as a
-    reference for the orientation of the cross-section.
-    A workaround for vertical edges is included. The
-    function is void for edges with inconsistent slope
-    signs, as handling these would introduce an unnecessary
-    amount of complexity into the code.
-    """
-    if vx1[0] == vx0[0]: vx1[0] += 0.00001
-    slope = (vx1[1] - vx0[1]) / (vx1[0] - vx0[0])
-    # if the second edge does not exist, the cross section is
-    # still constructed based on the one existing edge
-    if vx2:
-        if vx2[0] == vx1[0]: vx2[0] += 0.00001
-        slope1 = (vx2[1] - vx1[1]) / (vx2[0] - vx1[0])
-        if np.sign(slope) != np.sign(slope1): return
-        len0, len1 = dist_topoint(vx0, vx1), dist_topoint(vx0, vx1)
-        slope = (slope * len0 + slope1 * len1) / (len0 + len1)
-    dy = np.sqrt((len_cross / 2)**2 / (slope**2 + 1))
-    dx = -slope * dy
-    cross = ((vx1[0] + dx, vx1[1] + dy),
-             (vx1[0] - dx, vx1[1] - dy))
-    # orientation test ensures that output cross-sections
-    # are always constructed with the right orientation,
-    # so that they can be used to construct road "curbs"
-    if orientation(vx0, vx1, cross[0]) != sense: return cross[::-1]
-    return cross
-
-def filter_outliers(vxs, degree = 5, only_detect = False,
-                    thres = 1, prox = None):
-    """ Performs 1D-smoothing (or alternatively, just outlier
-    detection) on a series of input points that form a 3D line.
-    Fits a polynomial f the desired degree to obtain a model,
-    and uses the data-model errors to identify outliers.
-    If smoothing is desired, it uses numpy interpolation to find
-    better values at the locations of outliers, and at locations
-    where elevation was missing originally. Edits the input in-place.
-    The parameter "thres" configures the outlier detection
-    threshold as the number of standard deviations where the cutoff
-    should occur. The parameter "prox" is for internal purposes,
-    it allows the fitting to take place only on a certain
-    percentage of the input points centred around the middle.
-    """
-    zs = vxs[:,2].copy()
-    if prox:
-        mid, cut = len(zs) // 2, round(len(zs) * prox // 2)
-        zs[:mid - cut] = np.NaN; zs[mid + cut + 1:] = np.NaN
-    if ((not prox and len(zs[np.isnan(zs)]) / len(zs) > 0.75)
-        or (prox and len(zs[~np.isnan(zs)]) < degree + 1)):
-        if only_detect == False:
-            # zero out the entire NBRS if it has too many NaNs
-            vxs[:,2] = np.full(len(zs), np.NaN)
-        return
-    # find model polynomial and compute model values
-    # exclude locations where the elevation is missing
-    diffs = np.insert(np.diff(vxs[:,:2], axis = 0), 0, 0, axis = 0)
-    # the x values of the 1D profile are
-    # based on 2D vertex distances
-    dsts = np.cumsum(np.sqrt((diffs ** 2).sum(axis = 1)))
-    zs_notnan, dsts_notnan = zs[~np.isnan(zs)], dsts[~np.isnan(zs)]
-    coeffs = np.polynomial.polynomial.polyfit(dsts_notnan, zs_notnan, 4)
-    model_zs = np.polynomial.polynomial.polyval(dsts, coeffs)
-    # compute the data-model errors and STD
-    error = np.abs(vxs[:,2] - model_zs)
-    std = np.std(error[~np.isnan(error)])
-    if std < 0.4: std = 0.4
-    # do not perform smoothing if only filtering is desired
-    if only_detect: return error > thres * std
-    # create an index of vertices where the elevation is
-    # either missing, or was identified as an outlier
-    out_ix = (error > thres) | np.isnan(error)
-    # if any were found, replace them with interpolated values
-    if len(out_ix) > 0:
-        zs[out_ix] = np.interp(dsts[out_ix], dsts[~out_ix], zs[~out_ix])
-        vxs[:,2] = zs
-
 
 class nbrs_manager:
     
@@ -214,59 +45,97 @@ class nbrs_manager:
         """Imports NWB, or a cropped NWB "tile" upon
         initialisation. NWB is stored as a geopandas
         GeoDataFrame. The intended usage is as follows:
-            1. Instantiate class with the path to the NWB tile.
-            2. Invoke .generate_nbrs() with either algorithm
-               to build Non-Branching Road Segments (NBRS).
-            3. Optionally, invoke .densify() with a threshold
-               in metres to also perform vertex densification.
-               Highly recommended, as NWB's sampling is coarse.
-            4. Invoke .estimate_elevations() with aligned AHN3
-               tile to perform an estimation of NWB elevations.
-            4. Optionally, plot either a single NBRS
-               via .plot() or all NBRS via .plot_all()
-            5. Optionally, write NBRS geometry to disc by
-               invoking .write_all().
-            6. Invoke .segment_lidar() with aligned DTB tile
-               to perform point cloud segmentation (pre-
-               selection of AHN3 points that fall on the road
-               surfaces belonging to specific NBRS).
-               Post-segmentation, the sublocuds can be found
-               in .nbrs_subclouds, which needs to be indexed
-               with an NBRS ID to return a subcloud.
-            7. Optionally, write to segmented point cloud to
-               disk as a LAS file by invoking .write_subclouds().
-            8. Invoke .estimate_edges() to construct crude edge
-               estimates. Currently, both the edge estimates
-               and the cross-sections are stored as NBRS-level
-               geometries in .nbrs_edges and .nbrs_crosses,
-               which need to be indexed with an NBRS ID to
-               return edges/cross-sections.
-            9. Optionally, write the edges and cross-sections
-               to disk by invoking .write_edges().
-        NOTE: the edges and cross-sections are stored as 3D
-            geometries. This is for reference purposes only, as
-            their planned use is to provide initial road edge
-            estimates for the upcoming active contour optimisation
-            feature, which is an intrinsically 2D procedure.
+            1.  Instantiate class with the path to the NWB tile.
+            2.  Invoke .generate_nbrs() with either algorithm
+                to build Non-Branching Road Segments (NBRS).
+            3.  Optionally, invoke .densify() with a threshold
+                in metres to also perform vertex densification.
+                Highly recommended, as NWB's sampling is coarse.
+            4.  Invoke .estimate_elevations() with aligned AHN3
+                tile to perform an estimation of NWB elevations.
+            4.  Optionally, plot either a single NBRS
+                via .plot() or all NBRS via .plot_all()
+            5.  Optionally, write NBRS geometry to disc by
+                invoking .write_all().
+            6.  Invoke .segment_lidar() with aligned DTB tile
+                to perform point cloud segmentation (pre-
+                selection of AHN3 points that fall on the road
+                surfaces belonging to specific NBRS).
+                Post-segmentation, the sublocuds can be found
+                in .nbrs_subclouds, which needs to be indexed
+                with an NBRS ID to return a subcloud.
+            7.  Optionally, write to segmented point cloud to
+                disk as a LAS file by invoking .write_subclouds().
+            8.  Invoke .estimate_edges() to construct crude edge
+                estimates. Currently, both the edge estimates
+                and the cross-sections are stored as NBRS-level
+                geometries in .nbrs_edges and .nbrs_crosses,
+                which need to be indexed with an NBRS ID to
+                return edges/cross-sections.
+            9.  Optionally, write the edges and cross-sections
+                to disk by invoking .write_edges().
+            10. Optionally, run .optimise_edges() to perform
+                active contour optimisation of the edges. The
+                optimised edges (or "contours") are stored in
+                .nbrs_contours. Fine-tuning the parametrisation
+                may be necessary.
+            11. Active contour optimisation generates attractor
+                maps (rasters) for each NBRS. These can be optionally
+                written to dis using .write_maps(), writing to a
+                dedicated folder is recommended because each
+                NBRS map (and type of map, if applicable) is
+                written to a separate file. The rasters are
+                written in the GeoTIFF format.
+            12. Optionally, the optimised edges can also be
+                written to disk using .write_contours, this is
+                written to a single shapefile as usual.
+            13. Invoke .build_tins() to construct the TIN surface
+                models for each NBRS. It can use either the
+                preliminary edges or the optimised ones.
+                Fine-tuning the parametrisation may be necessary.
+            14. Optionally, the TINs can be written to disk as
+                OBJ files, one for each NBRS. An algorithm
+                is included to remove most of the big triangles
+                that fill the convex hull of the model, and
+                some of the sliver triangles that appear around
+                the road surface edges. One TIN is written at a
+                time, as the method is intended primarily for
+                debugging use and is not particularly fast.
+            15. Invoke .interpolate_elevations() to compute the
+                final 3D-NWB elevations. These are interpolated
+                in the TINs produced in step 13, and continuity
+                across NBRS intersections is enforced.
+            16. Use .write_all() to write the 3D-NWB geometries
+                to disk. The output is identical in its structure
+                to that which can be exported in step 5, but the
+                elevations are much more accurate because of the
+                additional processing steps.
         Example calls are provided at the end of this script.
         """
         nwb = gpd.read_file(fpath); nwb['NBRS_ID'] = None
         nwb = nwb[~nwb['geometry'].isnull()]
         nwb['geometry_type'] = nwb['geometry'].apply(get_geom_type)
         nwb = nwb[nwb['geometry_type'] == 'LineString']
-        self.nwb = nwb.drop(['geometry_type'], 1)
-        self.nbrs, self.jte, self.nbrs_subclouds = {}, {}, {}
-        self.geoms = dict(zip(self.nwb['WVK_ID'],
-                              self.nwb['geometry']))
-        self.origins = dict(zip(self.nwb['WVK_ID'],
-                                self.nwb['geometry'].apply(make_geom_idcol)))
-        self.wvk_count, self.nbrs_count = len(self.nwb.index), 0
-        self.nbrs_ids, self.nbrs_geoms, self.nbrs_revs = {}, {}, {}
-        self.nbrs_edges, self.nbrs_crosses = [], []
+        self.nwb, self.thres = nwb.drop(['geometry_type'], 1), None
+        self.wvk_count, self.jte = len(self.nwb.index), {}
+        self.wvk_geoms = dict(zip(self.nwb['WVK_ID'],
+                                  self.nwb['geometry']))
+        self.wvk_origins = dict(zip(self.nwb['WVK_ID'],
+                                    self.nwb['geometry'].apply(
+                                        make_geom_idcol)))
+        self.nbrs_count, self.nbrs_ids, self.nbrs_wvkn = 0, {}, {}
+        self.nbrs_revs, self.nbrs_geoms, self.nbrs_subclouds,  = {}, {}, {}
+        self.nbrs_parts, self.nbrs_edges, self.nbrs_crosses = {}, [], []
+        self.nbrs_extents, self.nbrs_ress, self.nbrs_origins = {}, {}, {}
+        self.wvk_z_origins, self.nbrs_maps, self.mapsize = {}, {}, 0
+        self.ahn3, self.las_header, self.flat_vxs = None, None, []
+        self.dtb, self.nbrs_tins, self.nbrs_dtb_ref_sets = None, {}, {}
+        self.nbrs_edges = gpd.GeoDataFrame()
+        self.nbrs_crosses = gpd.GeoDataFrame()
+        self.nbrs_contours = gpd.GeoDataFrame()
     
     def is_empty(self):
-        """Return True if NBRS have been generated,
-        else return False.
+        """Return True if NBRS have been generated, else return False.
         """
         if not self.nbrs_count: return True
         return False
@@ -290,7 +159,7 @@ class nbrs_manager:
         else: return list(range(self.nbrs_count))
     
     def get(self, nbrs_id):
-        """Return NBRS with a particular ID as a GeoDataFrame.
+        """Return the NBRS having the provided NBRS ID as a GeoDataFrame.
         """
         if self.is_empty(): print('NBRS first need to be generated.')
         available_ids = self.get_ids()
@@ -299,35 +168,35 @@ class nbrs_manager:
         else: return self.nwb[self.nwb['NBRS_ID'] == nbrs_id].copy()
     
     def get_geom(self, nbrs_id):
-        """Return the geometries of a given wegvak. Since the
-        wegvakken in self.nbrs are stored in-order, this method
+        """Return the geometries of a given NBRS. Since the
+        wegvakken in self.nbrs_wvkn are stored in-order, this method
         also returns them in the correct order.
         """
-        wvk_ids = self.nbrs[nbrs_id]
-        if wvk_ids: return [self.geoms[wvk_id] for wvk_id in wvk_ids]
+        wvk_ids = self.nbrs_wvkn[nbrs_id]
+        if wvk_ids: return [self.wvk_geoms[wvk_id] for wvk_id in wvk_ids]
     
     def get_wvk_geom(self, wvk_id):
         """Return the geometry of wegvak with the provided wegvak ID.
         """
-        geom = self.geoms.get(wvk_id)
+        geom = self.wvk_geoms.get(wvk_id)
         if geom: return geom
         else: print('Wegvak not found.')
     
     def set_wvk_geom(self, wvk_id, new_geom):
-        """Set the geometry of wegvak with the provided wegvak ID.
+        """Set the geometry of the wegvak having the provided wegvak ID.
         Both the hashed-storage geometry and the GeoDataFrame
         geometry are reset.
         """
         geom_col = self.nwb.geometry.name
-        if wvk_id in self.geoms.keys():
+        if wvk_id in self.wvk_geoms.keys():
             self.nwb.loc[self.nwb['WVK_ID'] == wvk_id, geom_col] = new_geom
-            self.geoms[wvk_id] = new_geom
+            self.wvk_geoms[wvk_id] = new_geom
         else: print('Wegvak not found.')
         
     def set_geocol(self, new_colname):
         """Set the geometry column of the NWB GeoDataFrame to a new
-        column. This is needed, so that the class behaves similar to
-        the GeoDataFrame itself.
+        column. This is implemented, so that the class behaves the
+        same way as the GeoDataFrame itself does.
         """
         if new_colname in self.nwb.columns:
             try: self.nwb.set_geometry(new_colname, inplace = True)
@@ -353,51 +222,143 @@ class nbrs_manager:
     def plot_all(self):
         """Plots all the NBRS that were generated.
         Uses random colours to help distinguish between
-        NBRS that run close to each other.
+        NBRS that run close to each other. To visualise
+        results in 3D, please write them to file and open
+        then in a suitable 3D viewer.
         """
         if self.is_empty():
             print('WARNING: NBRS have not been generated yet.')
-        cmap = matplotlib.colors.ListedColormap(np.random.rand(256,3))
+        cmap = mpl.colors.ListedColormap(np.random.rand(256,3))
         self.nwb.plot(column = 'NBRS_ID', cmap = cmap)        
         
     def write_all(self, fpath, to_drop = ['geometry']):
-        """Writes all the NBRS that were generated.
+        """Writes road geometry currently stored in the object.
+        Running it after preliminary elevation estimation
+        but before the final interpolation writes intermediate
+        results. Running it after the final interpolation
+        writes the final 3D road network.
         """
         if self.is_empty():
             print('WARNING: NBRS have not been generated yet.')
         self.nwb.drop(to_drop, 1).to_file(fpath)
         
     def write_subclouds(self, fpath):
-        """Writes all the subclouds that were generated.
+        """Writes all the subclouds that were generated as a
+        LAS file, with the added NBRS ID and part ID information.
         """
         if not self.nbrs_subclouds:
-            print('ERROR: Subclouds have not been generated yet.')
-            return
-        subclouds = []
-        for key, item in self.nbrs_subclouds.items():
-            subclouds.append(np.c_[item, np.full(len(item), key)])
-        las_writer(fpath, self.las_header, np.concatenate(subclouds))
+            print('Subclouds have not been generated yet.'); return
+        subclouds_out = []
+        for nbrs_id, subclouds in self.nbrs_subclouds.items():
+            for part_id, subcloud in subclouds.items():
+                subclouds_out.append(np.c_[subcloud,
+                                           np.full(len(subcloud), nbrs_id),
+                                           np.full(len(subcloud), part_id)])
+        lib_shared.las_writer(fpath, self.las_header,
+                              np.concatenate(subclouds_out))
         
     def write_edges(self, fpath_edges, fpath_crosses):
         """Writes the crude edges (and cross-sections) that were
         generated. A file path for both the edges and the cross-
         sections needs to be provided.
         """
-        if len(self.nbrs_edges) == 0:
-            print('ERROR: Edges have not been generated yet.')
-            return
+        if self.nbrs_edges.empty:
+            print('Edges have not been generated yet.'); return
         self.nbrs_edges.to_file(fpath_edges)
         self.nbrs_crosses.to_file(fpath_crosses)
+        
+    def write_maps(self, fpath):
+        """Writes the attractor maps of all NBRS.
+        An NBRS may consist of parts, in which case multiple
+        files per NBRS will be written. The file path should
+        lead to a directory, the file names inside the
+        directory will be auto-generated. The files will
+        be written in the GeoTIFF format.
+        """
+        if not self.nbrs_maps:
+            print('Maps have not been generated yet.'); return
+        for nbrs_id, parts in self.nbrs_maps.items():
+            for part_id, img in parts.items():
+                orig = self.nbrs_origins[nbrs_id][part_id]
+                fname = '{}_{}_{}.tif'.format(fpath, nbrs_id, part_id)
+                lib_shared.write_geotiff(img, orig, self.mapsize, fname)
+                
+    def write_contours(self, fpath):
+        """Writes the road surface contours that were generated.
+        """
+        if self.nbrs_contours.empty:
+            print('Contours have not been generated yet.'); return
+        self.nbrs_contours.to_file(fpath)
+    
+    def write_tin(self, fpath, nbrs_id):
+        """Writes a single road surface model TIN to disk.
+        An NBRS may consist of parts, in which case multiple
+        files will be written, tagged by the part ID. The file
+        path should lead to a directory, the file names inside
+        the directory will be auto-generated. The files will
+        be written in the OBJ format, and most of the large,
+        non-meaningful triangles will be filtered out.
+        """
+        if not self.nbrs_tins:
+            print('TINs have not been generated yet.'); return
+        tins = self.nbrs_tins.get(nbrs_id)
+        if not tins:
+            print('NBRS has no TINs.'); return
+        for part_id in range(len(self.nbrs_parts[nbrs_id])):
+            tin = tins.get(part_id)
+            if not tin: continue
+            out_pts = np.array(tin.all_vertices())
+            trs, out_trs = np.array(tin.all_triangles()), []
+            for tr in trs:
+                vxs = np.array([out_pts[tix] for tix in tr])
+                cross = np.cross(vxs[1] - vxs[0], vxs[2] - vxs[0])
+                area = lib_shared.dist_topoint([0, 0, 0], cross) / 2
+                a = lib_shared.dist_topoint(vxs[0], vxs[1])
+                b = lib_shared.dist_topoint(vxs[1], vxs[2])
+                c = lib_shared.dist_topoint(vxs[2], vxs[0])
+                if area < 50 and a + b + c < 20: out_trs.append(tr)
+            fname = '{}_{}_{}.obj'.format(fpath, nbrs_id, part_id)
+            with open(fname, "w") as file_out:
+                for pt in out_pts[1:]:
+                    file_out.write('v {} {} {}\n'.format(*pt))
+                for tr in out_trs:
+                    file_out.write('f {} {} {}\n'.format(*tr))
+    
+    def write_tins(self, fpath):
+        """Writes all the road surface model TINs to disk.
+        An NBRS may consist of parts, in which case multiple
+        files will be written, tagged by the part ID. The file
+        path should lead to a directory, the file names inside
+        the directory will be auto-generated. The files will
+        be written in the OBJ format, and most of the large,
+        non-meaningful triangles will be filtered out.
+        """
+        if not self.nbrs_tins:
+            print('TINs have not been generated yet.'); return
+        for nbrs_id, tins in self.nbrs_tins.items():
+            for part_id in range(len(self.nbrs_parts[nbrs_id])):
+                tin = tins.get(part_id)
+                if not tin: continue
+                out_pts = np.array(tin.all_vertices())
+                trs, out_trs = np.array(tin.all_triangles()), []
+                for tr in trs:
+                    vxs = np.array([out_pts[tix] for tix in tr])
+                    cross = np.cross(vxs[1] - vxs[0], vxs[2] - vxs[0])
+                    area = lib_shared.dist_topoint([0, 0, 0], cross) / 2
+                    a = lib_shared.dist_topoint(vxs[0], vxs[1])
+                    b = lib_shared.dist_topoint(vxs[1], vxs[2])
+                    c = lib_shared.dist_topoint(vxs[2], vxs[0])
+                    if area < 50 and a + b + c < 20: out_trs.append(tr)
+                fname = '{}_{}_{}.obj'.format(fpath, nbrs_id, part_id)
+                with open(fname, "w") as file_out:
+                    for pt in out_pts[1:]:
+                        file_out.write('v {} {} {}\n'.format(*pt))
+                    for tr in out_trs:
+                        file_out.write('f {} {} {}\n'.format(*tr))
     
     def generate_nbrs(self, algorithm = 'geometric'):
-        """Starts either NBRS generation algorithm. For the
-        threshold, around 15-25m works well for all testing
-        "tiles". Both algorithms work equally well for all
-        testing tiles, see below for more details. In this
-        release, both algorithms now use hashing for all
-        operations, hence their performance does not differ
-        significantly. The GeoDataFrame is queried/edited
-        only where absolutely necessary.
+        """Starts either NBRS generation algorithm.
+        The two algorithms are: 'geometric', 'semantic'.
         """
         if not self.is_empty(): print('NBRS have already been generated.')
         elif algorithm == 'geometric': self._generate_nbrs_geometric()
@@ -406,18 +367,18 @@ class nbrs_manager:
     
     def _generate_nbrs_geometric(self):
         """Performs the geometry-based NBRS-generation.
-        No geometric overlapping of NBRS is enforced "formally"
+        Geometric non-overlapping of NBRS is enforced "formally"
         via intersection checks. Furthermore, the navigation
         of the topology and the selection of the best candidate
         for continuation in intersections also takes place
         exclusively via examining the geometry, semantic
-        information is not used to any extent.
+        information is not used in any way.
         """
         print('\nSTARTING NBRS GENERATION')
         # build a hashing-based navigation structure of
         # the NWB topology based on linking each intersection
         # location to the wegvakken that end/begin there
-        for wvk_id, lstr in self.geoms.items():
+        for wvk_id, lstr in self.wvk_geoms.items():
             last_vx = tuple(np.round(lstr.coords[-1], 1))
             first_vx = tuple(np.round(lstr.coords[0], 1))
             end, beg = self.jte.get(last_vx), self.jte.get(first_vx)
@@ -431,10 +392,10 @@ class nbrs_manager:
         # starting from the first vertex
         i = 0
         while len(self.nbrs_ids) < self.wvk_count:
-            wvk_id = (self.geoms.keys() - self.nbrs_ids.keys()).pop()
+            wvk_id = (self.wvk_geoms.keys() - self.nbrs_ids.keys()).pop()
             # start a new NBRS with the chosen wegvak
-            self.nbrs[i], self.nbrs_ids[wvk_id] = [wvk_id], i
-            lstr = self.geoms[wvk_id]
+            self.nbrs_wvkn[i], self.nbrs_ids[wvk_id] = [wvk_id], i
+            lstr = self.wvk_geoms[wvk_id]
             self.nbrs_revs[i], self.nbrs_geoms[i] = [False], lstr
             self.nwb.loc[self.nwb['WVK_ID'] == wvk_id, 'NBRS_ID'] = i
             end_vx, beg_vx = lstr.coords[-2], lstr.coords[1]
@@ -449,14 +410,14 @@ class nbrs_manager:
         print('FINISHED NBRS GENERATION')
             
     def _join_wvk_geometric(self, prev_id, prev_vx, jt_vx, sense, nbrs_id):
-        """Traverse NWB recursively, attaching wegvakken
-        in one direction based on geometric rules.
+        """Internal method that recursively adds suitable
+        wegvakken to the NBRS that is being built.
         """
         nbrs_geom = self.nbrs_geoms[nbrs_id]
         # look for unused wegvakken starting from end
         # "intersection" of the last wegvak
         cont_ids = self.jte[jt_vx] - self.nbrs_ids.keys()
-        cont = {k: v for k, v in self.geoms.items() if k in cont_ids}
+        cont = {k: v for k, v in self.wvk_geoms.items() if k in cont_ids}
         # compute relative angles of outgoing vectors from
         # the intersection - vectors are based on the first
         # edge of each wegvak connected to the intersection
@@ -465,7 +426,9 @@ class nbrs_manager:
             if tuple(np.round(lstr.coords[0], 1)) == jt_vx:
                 cont_vecs[wvk_id] = lstr.coords[1]
             else: cont_vecs[wvk_id] = lstr.coords[-2]
-        angles = {calc_angle(jt_vx, prev_vx, vec): wvk_id
+        angles = {lib_shared.calc_angle(
+                            np.array(prev_vx) - np.array(jt_vx),
+                            np.array(vec) - np.array(jt_vx)): wvk_id
                   for wvk_id, vec in cont_vecs.items()}
         # this is an override for intersections that join
         # exactly three wegvakken - this is typical where
@@ -473,8 +436,9 @@ class nbrs_manager:
         # continuing ramp NBRS on motorways
         if len(cont_vecs) == 2:
             vecs = [vec for _, vec in cont_vecs.items()]
-            if calc_angle(jt_vx, vecs[0], vecs[1]) > max(angles.keys()):
-                return
+            if (lib_shared.calc_angle(np.array(vecs[0]) - np.array(jt_vx),
+                                      np.array(vecs[1]) - np.array(jt_vx))
+                > max(angles.keys())): return
         # work through the "stack" of candidate wegvakken
         # in the order of decreasing angle optimality -
         # when found a good one, add it to the NBRS and
@@ -495,8 +459,8 @@ class nbrs_manager:
                 # if passed all the checks, add to NBRS and
                 # make the next recursive call
                 self.nbrs_geoms[nbrs_id] = merged
-                if sense == 'end': self.nbrs[nbrs_id].append(best_id)
-                else: self.nbrs[nbrs_id].insert(0, best_id)
+                if sense == 'end': self.nbrs_wvkn[nbrs_id].append(best_id)
+                else: self.nbrs_wvkn[nbrs_id].insert(0, best_id)
                 self.nbrs_ids[best_id] = nbrs_id
                 self.nwb.loc[self.nwb['WVK_ID'] == best_id,
                              'NBRS_ID'] = nbrs_id
@@ -515,11 +479,11 @@ class nbrs_manager:
         The selection of the best candidate wegvak in intersections
         is handled using the same geometric tools as in the other
         algorithm, but additional filtering is performed.
-        Only roads with the same wegnummer are allowed to be in the
-        same NBRS. Furthermore, the BST-code in a given NBRS also
+        Only roads with the same 'wegnummer' are allowed to be in the
+        same NBRS. Furthermore, the 'BST' code in a given NBRS also
         needs to be consistent, apart from 'PST' which always
         denotes the last wegvak that joins a ramp to a motorway.
-        As such, they are always isolated in terms of their BST-
+        As such, they are always isolated in terms of their 'BST' 
         codes and are therefore merged into the ramp-NBRS that
         they are spatially consistent with.
         """
@@ -530,7 +494,7 @@ class nbrs_manager:
         # in the attribute table of NWB
         self.jte_end = dict(zip(self.nwb['WVK_ID'], self.nwb['JTE_ID_END']))
         self.jte_beg = dict(zip(self.nwb['WVK_ID'], self.nwb['JTE_ID_BEG']))
-        for wvk_id in self.geoms.keys():
+        for wvk_id in self.wvk_geoms.keys():
             end_id, beg_id = self.jte_end[wvk_id], self.jte_beg[wvk_id]
             end, beg = self.jte.get(end_id), self.jte.get(beg_id)
             if not end: self.jte[end_id] = [wvk_id]
@@ -552,16 +516,17 @@ class nbrs_manager:
             # ramps continuing in motorway wegvakken
             # this effectively replaces the geometry-based
             # override that is found in the other algorithm
-            wvk_ids = [k for k in self.geoms.keys()
+            wvk_ids = [k for k in self.wvk_geoms.keys()
                        if not self.bst_codes[k] == 'PST']
             unused_ids = set(wvk_ids) - self.nbrs_ids.keys()
             if unused_ids: wvk_id = unused_ids.pop()
-            else: wvk_id = (self.geoms.keys() - self.nbrs_ids.keys()).pop()
+            else: wvk_id = (self.wvk_geoms.keys()
+                            - self.nbrs_ids.keys()).pop()
             # start a new NBRS with the chosen wegvak
-            self.nbrs[i], self.nbrs_ids[wvk_id] = [wvk_id], i
+            self.nbrs_wvkn[i], self.nbrs_ids[wvk_id] = [wvk_id], i
             self.nbrs_bst[i] = self.bst_codes[wvk_id]
             self.nbrs_wegnos[i] = self.wegnos[wvk_id]
-            lstr = self.geoms[wvk_id]
+            lstr = self.wvk_geoms[wvk_id]
             self.nbrs_revs[i] = [False]
             self.nwb.loc[self.nwb['WVK_ID'] == wvk_id, 'NBRS_ID'] = i
             end_vx, beg_vx = lstr.coords[-2], lstr.coords[1]
@@ -575,7 +540,8 @@ class nbrs_manager:
         self.nbrs_count = i
         # delete two large navigation dictionaries that will
         # no longer be needed and are just taking up space
-        del self.jte_end, self.jte_beg
+        del (self.jte_end, self.jte_beg, self.nbrs_bst,
+             self.nbrs_wegnos, self.bst_codes, self.wegnos)
         print('FINISHED NBRS GENERATION')
     
     def _join_wvk_semantic(self, prev_id, prev_vx, prev_jt, sense, nbrs_id):
@@ -589,7 +555,7 @@ class nbrs_manager:
         cont_ids = [k for k in self.jte[prev_jt]
                     if self.wegnos[k] == self.nbrs_wegnos[nbrs_id]]
         cont_ids = set(cont_ids) - self.nbrs_ids.keys()
-        cont = {k: v for k, v in self.geoms.items() if k in cont_ids}
+        cont = {k: v for k, v in self.wvk_geoms.items() if k in cont_ids}
         # compute relative angles of outgoing vectors from
         # the intersection - vectors are based on the first
         # edge of each wegvak connected to the intersection
@@ -599,7 +565,9 @@ class nbrs_manager:
                 cont_vxs[wvk_id] = lstr.coords[:2]
                 cont_revs[wvk_id] = False
             else: cont_vxs[wvk_id] = (lstr.coords[-1], lstr.coords[-2])
-        angles = {calc_angle(vxs[0], prev_vx, vxs[1]): wvk_id
+        angles = {lib_shared.calc_angle(
+                            np.array(prev_vx) - np.array(vxs[0]),
+                            np.array(vxs[1]) - np.array(vxs[0])): wvk_id
                   for wvk_id, vxs in cont_vxs.items()}
         # work through two "stacks" of candidate wegvakken
         # in the order of decreasing angle optimality
@@ -626,8 +594,8 @@ class nbrs_manager:
         # intersection test with the pre-existing merged NBRS
         # geometry is not performed in this algorithm
         if best_id:
-            if sense == 'end': self.nbrs[nbrs_id].append(best_id)
-            else: self.nbrs[nbrs_id].insert(0, best_id)
+            if sense == 'end': self.nbrs_wvkn[nbrs_id].append(best_id)
+            else: self.nbrs_wvkn[nbrs_id].insert(0, best_id)
             self.nbrs_ids[best_id] = nbrs_id
             self.nwb.loc[self.nwb['WVK_ID'] == best_id,
                          'NBRS_ID'] = nbrs_id
@@ -642,94 +610,52 @@ class nbrs_manager:
                                     next_jt, sense, nbrs_id)
             
     def densify(self, thres):
-        """This method densifies the vertices of the wegvakken
-        to respect an input distance threshold (in metres).
-        Each edge in each wegvak is checked, and is split in two
-        if necessary. The same is then done to the resulting
-        halves until the specified threshold is respected.
+        """Densifies the vertices of the wegvakken to respect
+        an input distance threshold (in metres). Each edge in
+        each wegvak is checked, and is split in two if necessary.
+        The same is then done to the resulting halves (recursively)
+        until the specified threshold is respected.
         """
-        self.thres = thres
         print('\nSTARTING NBRS DENSIFICATION')
+        if self.thres:
+            print('WARNING: Densification has already taken place.')
+        self.thres = thres
         # iterate all wegvakken
-        for wvk_id in self.geoms.keys():
-            wvk_geom, origins = self.geoms[wvk_id], self.origins[wvk_id]
-            wvk_geom, origins = self._densify_lstr(wvk_geom, thres, origins)
+        for wvk_id in self.wvk_geoms.keys():
+            wvk_geom = self.wvk_geoms[wvk_id]
+            origins = self.wvk_origins[wvk_id]
+            wvk_geom, origins = lib_shared.densify_lstr(wvk_geom,
+                                                        thres, origins)
             self.set_wvk_geom(wvk_id, wvk_geom)
-            self.origins[wvk_id] = origins
+            self.wvk_origins[wvk_id] = origins
         print('FINISHED NBRS DENSIFICATION')
-
-    def _densify_lstr(self, lstr, thres, origins = None):
-        orig_coords = lstr.coords; orig_len = len(orig_coords)
-        i, j = 0, 0
-        while i < orig_len - 1:
-            vxs = orig_coords[i:i+2]
-            # start the recursive vertex densification
-            # of the selected edge of the wegvak
-            dense = LineString(self._densify_edge(vxs, thres))
-            # add the new vertices to the list that
-            # indicates origin, and mark that they
-            # originate from densification
-            diff = len(dense.coords) - 2
-            if origins:
-                origins = origins[:j+1] + ['added'] * diff + origins[j+1:]
-            # special case: wegvak is a single edge
-            if orig_len == 2: lstr = dense
-            else:
-                # patch the densified edge into the original
-                # wegvak (by replacing original edge)
-                split = ops.split(lstr, MultiPoint(vxs))
-                # special case: first edge of wegvak
-                if not i: to_merge = MultiLineString([dense, split[1]])
-                # special case: last edge of wegvak
-                elif i == orig_len - 2:
-                    to_merge = MultiLineString([split[0], dense])
-                # general case
-                elif len(split) != 3: return
-                else: to_merge = MultiLineString([split[0],
-                                                  dense, split[2]])
-                lstr = ops.linemerge(to_merge)
-            i, j = i + 1, i + diff + 1
-        return lstr, origins
-
-    def _densify_edge(self, edge, thres):
-        """Internal method that recursively densifies an edge.
-        It splits the edge while opening new frames on the
-        stack, and merges them when returning out of the frames.
-        New in this version: no shapely objects are used in
-        the recursion to speed up processing.
-        """
-        dst = dist_topoint(edge[0], edge[1])
-        # if distance threshold is not respected: split
-        if dst > thres:
-            pt = tuple(np.mean(edge, axis = 0))
-            edge_0, edge_1 = (edge[0], pt), (pt, edge[1])
-            # recursively split first half and second half
-            edge_0 = self._densify_edge(edge_0, thres)
-            edge_1 = self._densify_edge(edge_1, thres)
-            # merge the two halves when recursion is done
-            return edge_0[:-1] + edge_1
-        # if distance threshold is respected: return edge
-        else: return edge
         
-    def estimate_elevations(self, fpath):
-        if self.has_preliminary_z():
-            print('Preliminary elevations have already been generated.')
-            return
+    def estimate_elevations(self, fpath, thin = 2):
+        """Produces preliminary elevations for the road network.
+        Each NBRS vertex is associated with an elevation based on
+        nearby Lidar points. Artefacts due to occlusion are then
+        (mostly) eliminated by fittin high-degree polynomials.
+        Where the polynomial fit indicates outliers, the values
+        are re-set according to the model.
+        """
+        nbrs_ids = self.get_ids()
+        if not nbrs_ids: return
         print('\nSTARTING PRELIMINARY ELEVATION ESTIMATION')
         # import and subsample Lidar
         print('IMPORTING AHN3 TILE')
-        self.ahn3, self.las_header = las_reader(fpath)
-        self.ahn3 = self.ahn3[::3]
+        self.ahn3, self.las_header = lib_shared.las_reader(fpath)
+        # apply thinning to the point cloud
+        self.ahn3 = self.ahn3[::thin]
         # build a list of all NBRS vertex counts and vertices -
         # per-NBRS lists are needed for smoothing, and a
         # completely flat list of all vertices is needed
         # for the initial KD-tree query
         print('FLATTENING ALL NBRS')
         self.nbrs_vxnos, self.nbrs_revs, flat_vxs = {}, {}, []
-        for nbrs_id in self.get_ids():
+        for nbrs_id in nbrs_ids:
             nbrs_geom = self.get_geom(nbrs_id)
             # although the wegvak IDs are in the correct order
-            # in NBRS lists in self.nbrs, the LineString
+            # in NBRS lists in self.nbrs_wvkn, the LineString
             # coordinates themselves are often reversed
             # randomly in NWB, meaning that we need to check for
             # reversals while we are flattening the lists
@@ -791,7 +717,7 @@ class nbrs_manager:
         # compute a rough z-value for each NBRS vertex,
         # perform the smoothing workflow when an NBRS is
         # completed, and add 3D geometries to GeoDataFrame
-        self.flat_vxs, self.z_wasnan, first = [], {}, 0
+        first = 0
         for nbrs_id in self.get_ids():
             nbrs_vxnos = self.nbrs_vxnos[nbrs_id]
             last = first + sum(nbrs_vxnos)
@@ -809,64 +735,62 @@ class nbrs_manager:
             nbrs_vxs_z = np.c_[nbrs_vxs, zs]
             # apply the elevation smoothing algorithm
             # to the 3D coordinate array
-            filter_outliers(nbrs_vxs_z)
+            lib_shared.filter_outliers(nbrs_vxs_z, 12, False, 0.2)
             # re-assemble the smoothed 3D coordinate arrays
             # into wegvak geometries and set the active wegvak
             # geometries of the class to these new geometries, and
             # also save indicator lists (per wegvak, like in
-            # self.origins) that record where the rough elevation
+            # self.wvk_origins) that record where the rough elevation
             # estimation originally failed - which is in turn
             # indicative of the presence of bridges, tunnels, etc.
             nbrs_vxnos = np.array(nbrs_vxnos); nbrs_vxnos[1:] += 1
             starts = np.roll(np.cumsum(nbrs_vxnos - 1), 1); starts[0] = 0
             ends = np.cumsum(nbrs_vxnos - 1) + 1
             self.flat_vxs += nbrs_vxs_z.tolist()
-            slices = [[nbrs_vxs_z[start:end], list(np.isnan(zs))]
-                      for start, end in zip(starts, ends)]
-            z_wasnan = []
-            for wvk_id, sliced, rev in zip(self.nbrs[nbrs_id], slices,
-                                           self.nbrs_revs[nbrs_id]):
-                if rev: sliced[0] = np.flip(sliced[0], axis = 0)
-                self.set_wvk_geom(wvk_id, LineString(sliced[0]))
-                z_wasnan += sliced[1]
-            self.z_wasnan[nbrs_id] = z_wasnan
+            nbrs_wvkn_z = [nbrs_vxs_z[start:end]
+                           for start, end in zip(starts, ends)]
+            for wvk_id, wvk_z, rev in zip(self.nbrs_wvkn[nbrs_id],
+                                          nbrs_wvkn_z,
+                                          self.nbrs_revs[nbrs_id]):
+                if rev: wvk_z = np.flip(wvk_z, axis = 0)
+                self.set_wvk_geom(wvk_id, LineString(wvk_z))
             first = last
         print('FINISHED PRELIMINARY ELEVATION ESTIMATION')
 
-    def segment_lidar(self, fpath):
+    def segment_lidar(self, fpath, r):
         """Performs DTB-assisted Lidar segmentation of the AHN3 tile.
         The steps of the procedure are as follows:
-            1. Densify DTB lines and create a pseudo-point-
-               cloud from their vertices.
+            1. Densify DTB lines and create a point cloud from
+               their vertices.
             2. Build KD-trees with the NBRS vertices, AHN3 points
                and DTB points.
             3. Perform least-squares plane fitting on the AHN3
-               points close to NBRS vertices. Save basic statstics
-               of relative and absolute plane orientation to be
-               able to detect when trend becomes unstable.
-               In case of instability, if DTB exists and is stable
-               locally, then adjust the plane to conform to it.
-               If not, then try to use the previous (stable)
-               plane, with a set number of maximum attempts.
-               If the number of maximum attempts are exceeded,
-               skip iterations until plane becomes stable again
-               by itself, or DTB becomes avaialable. This may
-               give rise to data gaps in rare cases.
-            4. Save the points that were added to subclouds along
-               with attributes to indicate which subcloud they are
-               part of, and whether they came from AHN3 or DTB.
-        NOTE: For the time being, no special workflow was implemented
-        for cases where DTB-based assistance is unavailable. This may
-        give rise to data gaps in rare cases, more frequently in the
-        case of provincial roads (where DTB generally does not exist).
-        A workflow is planned for implementation that will split NBRS
-        at locations that mark the boundary of plane instability and
-        unavailability of DTB, so that the rest of NBRS can still be
-        fitted accurately by isolating no-data regions.
+               points close to NBRS vertices, progressing along
+               NBRS vertices. Based on observing changes in basic
+               plane-fit-related statistics, detect when fits
+               become unstable. In case of instability, if DTB
+               exists and is useful locally, then use it to
+               stabilise plane fits. If not, then try to use the
+               previous (stable) plane. If this also fails, then
+               continue normally (even if this means that the
+               plane fit might now describe an overlying road).
+               Pre-select the points that conform with the plane fits.
+            4. Like in preliminary elevation estimation, re-associate
+               NBRS vertices with elevations based on the elevation
+               of close-by Lidar points, but this time use relevant
+               pre-selected points only. Insert breakpoints to
+               indicate the starting and ending points of no-data
+               regions. Exclude pre-selected points belonging to
+               plane fits in the no-data regions. This step
+               splits NBRS into parts, each with its own ID.
+            5. Assemble point clouds, one per NBRS part. Keep a record
+               of which points came from AHN3, and which ones from DTB.
         """
+        if not roads.flat_vxs:
+            print('Elevations first need to be estimated.'); return
         print('\nSTARTING POINT CLOUD SEGMENTATION')
         print('IMPORTING DTB')
-        dtb, r, dtb_vxs = gpd.read_file(fpath), self.thres, []
+        dtb, dtb_vxs = gpd.read_file(fpath), []
         dtb = dtb[~dtb['geometry'].isnull()]
         if len(dtb) != 0:
             dtb['geometry_type'] = dtb['geometry'].apply(get_geom_type)
@@ -877,7 +801,7 @@ class nbrs_manager:
             surf_cats = 'verflijn', 'verfstippellijn', 'blokmarkering'
             dtb_surf = self.dtb[self.dtb['OMSCHR'].isin(surf_cats)]
             for lstr in dtb_surf['geometry'].values:
-                densified = self._densify_lstr(lstr, 0.2 * r)
+                densified = lib_shared.densify_lstr(lstr, 0.2 * r)
                 # in cases of broken geometries (for instance
                 # linear rings stored as LineString objects)
                 # None will be returned - handle this here
@@ -889,38 +813,51 @@ class nbrs_manager:
         lidar_tree = cKDTree(self.ahn3[:,1:])
         # perform the aggregated NBRS-AHN3 query
         nbrs_ix = nbrs_tree.query_ball_tree(lidar_tree, r)
+        area = np.pi * r**2
         print('SEGMENTING POINT CLOUD')
         first = 0
         for nbrs_id in self.get_ids():
             nbrs_vxnos = self.nbrs_vxnos[nbrs_id]
             last = first + sum(nbrs_vxnos)
+            vxs = self.flat_vxs[first:last]
+            ixs = nbrs_ix[first:last]
+            first = last
             planes, lgroups = [], []
             # fit a plane on each group of AHN3 points that
             # were found to close to NWB vertices
-            for pt_ix in nbrs_ix[first:last]:
+            for pt_ix in ixs:
                 lgroups.append(np.array([])); planes.append(())
-                if len(pt_ix) > 10:
+                if len(pt_ix) / area > 1:
                     pts = self.ahn3[:,1:][pt_ix]; lgroups[-1] = pts
-                    if len(pt_ix) > 20: planes[-1] = (planefit_lsq(pts))
+                    if len(pt_ix) / area > 2:
+                        planes[-1] = (lib_shared.planefit_lsq(pts))
             # the main segmentation algorithm starts below
-            subcloud, subcloud_dtb, i = set(), set(), 0
+            subclouds, subclouds_dtb, can_revert = [], [], True
             prev_plane, prev_dist_p, prev_med_z = None, None, None
-            for vx, z_wasnan, lgroup, plane in zip(self.flat_vxs[first:last],
-                                                   self.z_wasnan[nbrs_id],
-                                                   lgroups, planes):
+            i = -1
+            for vx, lgroup, plane, in zip(vxs, lgroups, planes):
+                i += 1
+                vx_subcloud = np.empty([0, 3])
+                vx_subcloud_dtb = np.empty([0, 3])
+                # if previous vertex was a failed plane reversion,
+                # then add a breakpoint to the NBRS and reset rolling
+                # descriptors, so that a new elevation level
+                # can be established
+                if not can_revert:
+                    prev_plane, prev_dist_p, prev_med_z = None, None, None
                 # if no plane could be fitted or we already know there
                 # was an AHN3 data gap from preliminary elevation
                 # estimation, then immediately flag for assistance
-                need_assist = not plane or z_wasnan
+                need_assist = not plane
                 if not need_assist:
                     # compute close-by AHN3 points' distances
                     # to fitted plane and compute basic descriptors
-                    dists = np.array([dist_toplane(pt, *plane)
+                    dists = np.array([lib_shared.dist_toplane(pt, *plane)
                                       for pt in lgroup])
                     # standard deviation of distances from plane
                     std = np.std(dists)
                     # distance of plane from the NBRS vertex
-                    dist_p = dist_toplane(vx, *plane)
+                    dist_p = lib_shared.dist_toplane(vx, *plane)
                     # median of elevation of points
                     med_z = np.median(lgroup[:,2])
                     # special case: if first vertex of NBRS, then
@@ -937,13 +874,12 @@ class nbrs_manager:
                         dz = abs(1 - med_z / prev_med_z)
                     # if instability in the plane fitting is supected,
                     # flag for assist
-                    #if nbrs_id == 2: print(vx, std, dz, dp)
                     need_assist = std > 0.1 * r or (dz > 0.5 or dp > 0.5)
                 if need_assist:
                     pts = np.array([])
                     if len(dtb_vxs) > 0:
-                        # if a previous plane exists, move the location of
-                        # the forhcoming DTB query closer to the plane
+                        # if the previous plane exists, move the location
+                        # of the next DTB query closer to the plane
                         ctr = vx.copy()
                         if prev_plane: ctr[2] = prev_med_z
                         # perform individual DTB query
@@ -954,15 +890,23 @@ class nbrs_manager:
                         # accidental inclusion of underlying/overlying
                         # road surface markings
                         if prev_plane:
-                            dists = np.array([dist_toplane(pt, *prev_plane)
-                                              for pt in pts])
+                            dists = np.array([lib_shared.dist_toplane(pt,
+                                              *prev_plane) for pt in pts])
                             pts = pts[dists < 0.1 * r]
-                    # if DTB assist is possible...
+                    # if a DTB-assist is possible...
                     if len(pts) > 2:
                         # refit plane onto DTB-defined surface
-                        plane = planefit_lsq(pts)
+                        plane = lib_shared.planefit_lsq(pts)
+                        # requery DTB to include any points the
+                        # conservative radius above missed
+                        pt_ix = dtb_tree.query_ball_point(ctr, r)
+                        pts = dtb_vxs[pt_ix]
+                        dists = np.array([lib_shared.dist_toplane(pt, *plane)
+                                          for pt in pts])
+                        pts = pts[dists < 0.1 * r]
+                        plane = lib_shared.planefit_lsq(pts)
                         # re-compute AHN3 point distances to plane
-                        dists = np.array([dist_toplane(pt, *plane)
+                        dists = np.array([lib_shared.dist_toplane(pt, *plane)
                                           for pt in lgroup])
                         lclose = lgroup[dists < 0.1 * r]
                         # if many are close to the new plane, then
@@ -971,206 +915,791 @@ class nbrs_manager:
                         # well with the DTB-defined surface -
                         # this is necessary because DTB is not always
                         # perfectly conformant with the AHN3-defined
-                        # road surface, I have observed up to 1-1.5 m
-                        # deviations, e.g. at the Knoppunt Ridderkerk
-                        if len(lclose) > 20:
-                            plane = planefit_lsq(lclose)
+                        # road surface, with up to ~1m deviations
+                        if len(lclose) / area > 2:
+                            plane = lib_shared.planefit_lsq(lclose)
                             prev_med_z = np.median(lclose[:,2])
                         else: prev_med_z = np.median(pts[:,2])
                         prev_plane = plane
-                        prev_dist_p = dist_toplane(vx, *plane)
+                        prev_dist_p = lib_shared.dist_toplane(vx, *plane)
                         # also save DTB points when DTB assistance
                         # completed succesfully
-                        for pt in pts: subcloud_dtb.add(tuple(pt))
-                    # if DTB assist is not possible...
+                        if len(pts) > 0: vx_subcloud_dtb = pts.copy()
+                    # else if a DTB-assist is not possible...
                     else:
-                        # if plane-reverting assistance had already
-                        # run 3 times consequently before, then
+                        # if plane-reverting assistance had
+                        # run in the previous iteration, then
                         # "give up" and skip to next NBRS vertex
-                        if i > 2 or not prev_plane: continue
-                        # else, try reverting the plane   
-                        plane = prev_plane
-                        dists = np.array([dist_toplane(pt, *prev_plane)
-                                          for pt in lgroup])
-                        i += 1
+                        if not can_revert or not prev_plane:
+                            dists = None
+                        # else, try reverting the plane (use previous)
+                        elif len(lgroup) != 0:
+                            lgroup = lgroup[(lgroup[:,2] - vx[2]) < 2]
+                            dists = np.array([lib_shared.dist_toplane(pt,
+                                              *prev_plane) for pt in lgroup])
+                            can_revert = False
                 else:
                     # roll the plane and the descriptors
                     prev_plane = plane
                     prev_dist_p, prev_med_z = dist_p, med_z
-                    i = 0
+                    can_revert = True
                 # pre-select those AHN3 points, which were very close
-                # to the fitted plane
-                lclose = lgroup[dists < 0.05 * r]
-                for pt in lclose: subcloud.add(tuple(pt))
-            # compile NBRS's subcloud from the pre-selected AHN3 and
-            # DTB points added in previous steps - each point may only
-            # be added once *per NBRS*
-            if subcloud:
-                # perform a quick outlier filtering on the subcloud
-                subcloud = np.array(list(subcloud))
-                subcloud_tree = cKDTree(subcloud)
-                subcloud_tree_len = subcloud_tree.n
-                _, ixs = subcloud_tree.query(subcloud, 3,
-                                             distance_upper_bound = 0.8,
-                                             workers = -1)
-                subcloud_mask = []
-                for pt_ixs in ixs:
-                    if len(pt_ixs[pt_ixs != subcloud_tree_len]) == 3:
-                        subcloud_mask += [True]
-                    else:
-                        subcloud_mask += [False]
-                subcloud = subcloud[subcloud_mask]
-                subcloud = np.c_[subcloud, np.full(len(subcloud), 0)]
-            else: subcloud = np.empty((0, 4))
-            if subcloud_dtb:
-                subcloud_dtb = np.c_[np.array(list(subcloud_dtb)),
-                                     np.full(len(subcloud_dtb), 1)]
-                subcloud = np.concatenate((subcloud, subcloud_dtb))
-            self.nbrs_subclouds[nbrs_id] = subcloud
-            first = last
+                # to the fitted plane, and save them -
+                # a single "Lidar patch" (spherical group of points)
+                # will be associated with each succesful plane fit,
+                # (so, one patch per NBRS vertex)
+                if dists is not None and len(lgroup) != 0:
+                    pre = lgroup[dists < 0.05 * r]
+                    if len(pre) > 0: vx_subcloud = pre
+                subclouds.append(vx_subcloud)
+                subclouds_dtb.append(vx_subcloud_dtb)
+            # if neither AHN3 nor DTB could yield enough points, then
+            # consider the process a failure and skip to the next NBRS
+            if (len(np.concatenate(subclouds)) < 100
+                and len(np.concatenate(subclouds_dtb)) < 50): 
+                self.nbrs_subclouds[nbrs_id] = {}
+                self.nbrs_dtb_ref_sets[nbrs_id] = {}
+                continue
+            # associate NBRS vertices with an elevation derived
+            # from close-by Lidar points in the Lidar patches
+            vxs_z = [[*vx[:2], np.median(np.concatenate([vx_sub,
+                                                         vx_sub_dtb])[:,2])]
+                     if len(vx_sub) > 10 or len(vx_sub_dtb) > 5
+                     else [*vx[:2], None]
+                     for vx, vx_sub, vx_sub_dtb
+                     in zip(vxs, subclouds, subclouds_dtb)]
+            mask = lib_shared.filter_outliers(np.array(vxs_z, dtype = float),
+                                              12, True, 5)
+            # post-process the outlier mask to also exclude patches
+            # with too few points inside of them
+            coverage = []
+            for vx_sub, vx_sub_dtb, masked in zip(subclouds, subclouds_dtb,
+                                                  mask):
+                if not masked:
+                    coverage += [len(vx_sub) / area > 1
+                                 or len(vx_sub_dtb) > 10]
+                else: coverage += [False]
+            # further post-process the mask to eliminate very short
+            # changes in coverage - the variable below controls the
+            # minimum length needed to accept a change from non-data
+            # to data region (or vice-versa)
+            min_len = 3
+            for i in range(len(coverage) - min_len):
+                curr = coverage[i]
+                if coverage[i + 1] != curr:
+                    cnt = 1
+                    for j in range(1, min_len):
+                        if coverage[i + 1 + j] != curr: cnt += 1
+                        else: break
+                    if cnt < min_len:
+                        for j in range(1, min_len + 1):
+                            if coverage[i + j] != curr:
+                                coverage[i + j] = curr
+            # generate the final breakpoints based on the mask
+            # generated above - the list contains pairs of indices,
+            # each corresponding to the beginning and end of a region
+            # with proper coverage
+            breakpts, beg = [], None
+            for curr, i in zip(coverage, range(len(coverage))):
+                if curr:
+                    if beg is None: beg = i
+                    elif i == len(coverage) - 1:
+                        breakpts.append([beg, i + 1])
+                elif beg is not None:
+                    breakpts.append([beg, i])
+                    beg = None
+            self.nbrs_parts[nbrs_id] = breakpts
+            self.nbrs_dtb_ref_sets[nbrs_id] = {}
+            self.nbrs_subclouds[nbrs_id] = {}
+            # compile NBRS's subclouds (one per NBRS part) from the
+            # pre-selected AHN3 and DTB points added in previous steps,
+            # each point may only be added once per NBRS part
+            for part_ix, part_id in zip(breakpts, range(len(breakpts))):
+                subcloud, subcloud_dtb = set(), set()
+                sc_zip = zip(subclouds[part_ix[0]:part_ix[1]],
+                             subclouds_dtb[part_ix[0]:part_ix[1]])
+                for vx_sub, vx_sub_dtb in sc_zip:
+                    for pt in vx_sub: subcloud.add(tuple(pt))
+                    for pt in vx_sub_dtb: subcloud_dtb.add(tuple(pt))
+                if subcloud:
+                    # perform quick outlier filtering on the subcloud
+                    subcloud = np.array(list(subcloud))
+                    subcloud_tree = cKDTree(subcloud)
+                    subcloud_tree_len = subcloud_tree.n
+                    _, s_ixs = subcloud_tree.query(subcloud, 3,
+                                                   distance_upper_bound = 0.8,
+                                                   workers = -1)
+                    subcloud_mask = []
+                    for pt_ixs in s_ixs:
+                        if len(pt_ixs[pt_ixs != subcloud_tree_len]) == 3:
+                            subcloud_mask += [True]
+                        else: subcloud_mask += [False]
+                    subcloud = subcloud[subcloud_mask]
+                    subcloud = np.c_[subcloud, np.full(len(subcloud), 0)]
+                else: subcloud = np.empty((0, 4))
+                # merge DTB patches also into the final subcloud, but
+                # create class-level sets of added DTB vertices, so that
+                # they can be easily recognised later on as such
+                dtb_ref_set = set()
+                if subcloud_dtb:
+                    subcloud_dtb = np.c_[np.array(list(subcloud_dtb)),
+                                         np.full(len(subcloud_dtb), 1)]
+                    dtb_rounded = np.round(subcloud_dtb[:,:2], 1)
+                    dtb_ref_set = set([tuple(pt) for pt in dtb_rounded])
+                    subcloud = np.concatenate((subcloud, subcloud_dtb))
+                self.nbrs_dtb_ref_sets[nbrs_id][part_id] = dtb_ref_set
+                self.nbrs_subclouds[nbrs_id][part_id] = subcloud
         print('FINISHED POINT CLOUD SEGMENTATION')
         
-    def estimate_edges(self):
-        """Method to construct crude preliminary edges estimates
+    def estimate_edges(self, min_width, max_width, thres, perc_to_fit):
+        """Method to construct crude preliminary edge-estimates
         based on NBRS's NWB locations and subclouds. Cross-sections
-        are constructed in NWB vertices (and densified vertices) and
-        the elevations of nearby subcloud points are used to
+        are constructed on NWB vertices (including densified vertices)
+        and the elevations of nearby subcloud points are used to
         transpose them into 3D (they are first densified to enable
-        better point cloud sampling). Line fitting is then used to
-        identify an edge point on both side of NWB in each cross-
+        better point cloud sampling). Line-fitting is then used to
+        identify an edge point on both sides of NWB onn each cross-
         section. The first conformant point is chosen from the
         ends of the cross-sections, progressing inwards (towards
-        NWB). If no such point could be found, the first cross-
-        section point (again, progressing inwards) with an existing
-        elevation is picked. In the absence of such a point, the
-        cross-section is "deleted".
+        NWB). In the absence of such a point, the cross-section is
+        not considered any further.
+        The first two parameters control the minimum and maximum
+        width of generated roads, but are hard limits but are
+        enforced differently. The third parameter is a threshold
+        that controls the number of standard deviations within
+        which points are classed as surface points (during the
+        line fitting step). The last parameter controls what
+        part of the cross-section will be fitted with the line,
+        as fitting the whole cross-section would corrupt the fit
+        significantly. Reducing the value takes out points close
+        to the ends of the cross-section, meaning that points close
+        to the NBRS vertex will be fitted.
         """
+        if not self.nbrs_subclouds:
+            print('Point cloud first needs to be segmented.'); return
         print('\nSTARTING PRELIMINARY ROAD EDGE ESTIMATION')
-        edgegeoms_l, edgegeoms_r, crossgeoms, first = [], [], [], 0
+        edge_dict = {'NBRS_ID': [], 'PART_ID': [],
+                     'SIDE': [], 'geometry': []}
+        cross_dict = {'NBRS_ID': [], 'PART_ID': [], 'geometry': []}
+        first = 0
         for nbrs_id in self.get_ids():
-            # gather necessary NBRS NWB and subcloud data
+            # gather necessary NBRS and subcloud data
             nbrs_vxnos = self.nbrs_vxnos[nbrs_id]
             last = first + sum(nbrs_vxnos)
             nbrs_vxs = self.flat_vxs[first:last]
-            subcloud = self.nbrs_subclouds[nbrs_id]
-            # special case: NBRS has empty subcloud
-            if len(subcloud) == 0:
-                edgegeoms_l += [LineString()]
-                edgegeoms_r += [LineString()]
-                crossgeoms += [MultiLineString()]
-                first = last
-                continue
-            # build 2D KD-tree from subcloud and create hashed
-            # link to the elevations of the tree's points
-            lidar_tree = cKDTree(subcloud[:,:2])
-            lidar_tree_len = lidar_tree.n
-            xy = [tuple(arr) for arr in subcloud[:,:2]]
-            link = dict(zip(xy, subcloud[:,2]))
-            # generate the cross-sections
-            vx0, vx1 = nbrs_vxs[0][:2], nbrs_vxs[1][:2]
-            # special case: cross-section on first NBRS vertex
-            cross_edges = [get_cross(vx1, vx0, None, self.thres, 1)]
-            # general case
-            for vx2 in nbrs_vxs[2:]:
-                cross_edges.append(get_cross(vx0, vx1, vx2[:2],
-                                             self.thres, -1))
-                vx0, vx1 = vx1, vx2[:2]
-            # special case: cross-section on last NBRS vertex
-            cross_edges.append(get_cross(vx0, vx1, None,
-                                         self.thres, -1))
-            # densify the cross-sections
-            cross_edges = [self._densify_edge(edge, 0.3)
-                           for edge in cross_edges
-                           if edge is not None]
-            cross_vxs = np.concatenate(cross_edges)
-            # fetch the Lidar points necessary to transpose
-            # the cross-sections into 3D
-            _, ixs = lidar_tree.query(cross_vxs, 10,
-                                      distance_upper_bound = 0.2,
-                                      workers = -1)
-            # transpose each (densified) cross-section vertex
-            # into 3D using the median of the elevations of
-            # the selected close-by subcloud points
-            cross_zs = []
-            for pt_ixs in ixs:
-                pt_xy = [xy[ix] if ix != lidar_tree_len
-                         else (None, None) for ix in pt_ixs]
-                pt_zs = [link[pt] if None not in pt
-                         else None for pt in pt_xy]
-                pt_zs = np.array(pt_zs, dtype = float)
-                pt_zs = pt_zs[~np.isnan(pt_zs)]
-                if len(pt_zs) == 0: cross_zs.append(None)
-                else: cross_zs.append(np.median(pt_zs))
-            cross_vxs = np.array(np.c_[cross_vxs, cross_zs], dtype = float)
-            # estimate crude edge locations
-            mid = len(cross_edges[0]) // 2
-            edges_l, edges_r, crosses = [], [], []
-            for vxs in np.split(cross_vxs, len(cross_edges)):
-                outliers = filter_outliers(vxs, 1, True, 1, 0.15)
-                if outliers is None: continue
-                missing = np.isnan(vxs[:,2])
-                edge_l, edge_r = None, None
-                # try looking for the first valid cross-section
-                # vertex (one with a non-outlier elevation),
-                # progressing inwards
-                for i in range(mid):
-                    if not outliers[i] and not missing[i]:
-                        edge_l = list(vxs[i]); break
-                for i in range(1, mid + 1):
-                    if not outliers[-i] and not missing[-i]:
-                        edge_r = list(vxs[-i]); break
-                # if insuccesful, try just getting the first one
-                # that has an elevation
-                if not edge_l:
-                    for i in range(mid):
-                        if not missing[i]:
-                            edge_l = list(vxs[i]); break
-                if not edge_r:
-                    for i in range(1, mid + 1):
-                        if not missing[-i]:
-                            edge_r = list(vxs[-i]); break
-                # if an edge point could be found on both sides
-                # of the NWB, then extend the road edge with
-                # them, and construct the cross-section geometry
-                if edge_l and edge_r:
-                    if not dist_topoint(edge_l, edge_r) < 2:
-                        edges_l.append(edge_l)
-                        edges_r.append(edge_r)
-                        crosses += [LineString((edge_l, edge_r))]
-            # construct the NBRS's edge and cross-section geometries
-            edgegeoms_l += [LineString(edges_l)]
-            edgegeoms_r += [LineString(edges_r)]
-            crossgeoms += [MultiLineString(crosses)]
             first = last
-        
-        # create GeoDataFrames with all the resulting road
-        # edge and cross-section geometries
-        sides = ['left'] * self.nbrs_count + ['right'] * self.nbrs_count
-        edge_dict = {'NBRS_ID': self.get_ids() + self.get_ids(),
-                     'SIDE': sides, 'geometry': edgegeoms_l + edgegeoms_r}
-        cross_dict = {'NBRS_ID': self.get_ids(), 'geometry': crossgeoms}
+            subclouds = self.nbrs_subclouds[nbrs_id]
+            # special case: NBRS has no subclouds
+            if not subclouds: continue
+            breakpts = self.nbrs_parts[nbrs_id]
+            for part_ix, part_id in zip(breakpts, range(len(breakpts))):
+                part_vxs = nbrs_vxs[part_ix[0]:part_ix[1]]
+                subcloud = subclouds[part_id][:,:3]
+                # build 2D KD-tree from subcloud
+                lidar_tree = cKDTree(subcloud[:,:2])
+                lidar_tree_len = lidar_tree.n
+                # generate the cross-sections
+                vx0, vx1 = part_vxs[0][:2], part_vxs[1][:2]
+                # special case: cross-section on first NBRS vertex
+                cross_edges = [lib_shared.get_cross(vx1, vx0, None,
+                                                    max_width, 1)]
+                # general case
+                for vx2 in part_vxs[2:]:
+                    cross_edges.append(lib_shared.get_cross(vx0, vx1, vx2[:2],
+                                                            max_width, -1))
+                    vx0, vx1 = vx1, vx2[:2]
+                # special case: cross-section on last NBRS vertex
+                cross_edges.append(lib_shared.get_cross(vx0, vx1, None,
+                                                        max_width, -1))
+                # densify the cross-sections
+                cross_edges = [lib_shared.densify_edge(edge, 0.1)
+                               for edge in cross_edges
+                               if edge is not None]
+                cross_vxs = np.concatenate(cross_edges)
+                # fetch the Lidar points necessary to transpose
+                # the cross-sections into 3D
+                _, ixs = lidar_tree.query(cross_vxs, 10,
+                                          distance_upper_bound = 0.25,
+                                          workers = -1)
+                # transpose each (densified) cross-section vertex
+                # into 3D using the median of the elevations of
+                # the selected close-by subcloud points
+                cross_zs = []
+                for pt_ixs in ixs:
+                    pts = subcloud[pt_ixs[pt_ixs != lidar_tree_len]]
+                    if len(pts) == 0: cross_zs.append(np.NaN)
+                    else: cross_zs.append(np.median(pts[:,2]))
+                cross_vxs = np.c_[cross_vxs, cross_zs]
+                # estimate crude edge locations
+                mid, prev_widths, prev_zs = len(cross_edges[0]) // 2, [], []
+                edges_l, edges_r, crosses, fails = [], [], [], 0
+                for vxs in np.split(cross_vxs, len(cross_edges)):
+                    outliers = lib_shared.filter_outliers(vxs, 1, True,
+                                                          thres, perc_to_fit)
+                    if outliers is None: continue
+                    missing = np.isnan(vxs[:,2])
+                    edge_l, edge_r = None, None
+                    # try looking for the first valid cross-section
+                    # vertex (one with a non-outlier elevation),
+                    # progressing inwards
+                    hits = 0
+                    for i in range(mid):
+                        if not outliers[i] and not missing[i]:
+                            if hits == 2 or fails > 2:
+                                edge_l = list(vxs[i]); break
+                            hits += 1
+                        else: hits = 0
+                    hits = 0
+                    for i in range(1, mid + 1):
+                        if not outliers[-i] and not missing[-i]:
+                            if hits == 2 or fails > 2:
+                                edge_r = list(vxs[-i]); break
+                            hits += 1
+                        else: hits = 0
+                    if not edge_l or not edge_r:
+                        fails += 1; continue
+                    # the below conditionals ensure that the shape of
+                    # the road surface (as defined by the edges) is
+                    # not too thin, not too angular and not too bumpy -
+                    # the conditions are relaxed after 3 failures to
+                    # prevent the algorithm from getting "stuck"
+                    width = lib_shared.dist_topoint(edge_l, edge_r)
+                    z = (edge_l[2] + edge_r[2]) / 2
+                    if width < min_width:
+                        fails += 1; continue
+                    if fails > 2:
+                        prev_widths = []
+                    if len(prev_zs) < 5:
+                        prev_zs += [(edge_l[2] + edge_r[2]) / 2]
+                    elif abs(np.mean(prev_zs) - z) > 1.5:
+                        fails += 1; continue
+                    else:
+                        prev_zs.pop(0)
+                        prev_zs += [z]
+                    if len(prev_widths) < 5:
+                        prev_widths += [width]
+                    elif abs(np.mean(prev_widths) - width) > 1:
+                        fails += 1; continue
+                    else:
+                        prev_widths.pop(0)
+                        prev_widths += [width]
+                    # extend the road edge with new edge points,
+                    # and construct the cross-section geometry
+                    fails = 0
+                    edges_l.append(edge_l)
+                    edges_r.append(edge_r)
+                    crosses += [LineString((edge_l, edge_r))]
+                # construct the part's edge and cross-section geometries
+                if len(crosses) > 1:
+                    edge_dict['NBRS_ID'] += [nbrs_id] * 2
+                    edge_dict['PART_ID'] += [part_id] * 2
+                    edge_dict['SIDE'] += ['left', 'right']
+                    edge_dict['geometry'] += [LineString(edges_l),
+                                              LineString(edges_r)]
+                    cross_dict['NBRS_ID'] += [nbrs_id]
+                    cross_dict['PART_ID'] += [part_id]
+                    cross_dict['geometry'] += [MultiLineString(crosses)]
+        # create GeoDataFrames with all the resulting road edge and
+        # cross-section geometries
         self.nbrs_edges = gpd.GeoDataFrame(edge_dict, crs="EPSG:28992")
         self.nbrs_crosses = gpd.GeoDataFrame(cross_dict, crs="EPSG:28992")
-        print('\nFINISHED PRELIMINARY ROAD EDGE ESTIMATION')
-        
+        print('FINISHED PRELIMINARY ROAD EDGE ESTIMATION')
+            
+    def optimise_edges(self, size, a, b, g, w_l, w_e, max_iter,
+                       chosen = None):
+        """Optionally, the preliminary edges can be optimised using
+        a method known as "active contour optimisation". This code
+        uses the implementation contained in the scikit-image package.
+        First the subclouds belonging to each NBRS are rasterised,
+        the resulting "attractor map" pixels contain information
+        about how smooth the surface is locally. The preliminary
+        edges are then iteratively moved towards the highest contrast
+        in smoothness in the rasters. The resulting optimised edges
+        or "contours" are stored in self.nbrs_contours.
+        The parameter 'size' controls the attractor map cell size
+        (in metres). All other parameters (except for the last) are
+        active contour optimisation parameters, documentation about
+        these can be found on scikit's website. The last parameter
+        'chosen' allows the user to execute the code for a single NBRS
+        by providing its ID, which may be useful for debug purposes.
+        """
+        if self.nbrs_edges.empty:
+            print('Preliminary edges first need to be generated.'); return
+        print('\nSTARTING EDGE OPTIMISATION')
+        self.mapsize, first = size, 0
+        contours = {'NBRS_ID': [], 'PART_ID': [], 'geometry': []}
+        for nbrs_id in self.get_ids():
+            nbrs_vxnos = self.nbrs_vxnos[nbrs_id]
+            last = first + sum(nbrs_vxnos)
+            nbrs_vxs = np.array(self.flat_vxs[first:last])
+            first = last
+            # special case: skip if NBRS has no subcloud
+            subclouds = self.nbrs_subclouds[nbrs_id]
+            if (chosen is not None and nbrs_id != chosen) or not subclouds:
+                continue
+            edges = self.nbrs_edges[self.nbrs_edges['NBRS_ID'] == nbrs_id]
+            self.nbrs_extents[nbrs_id] = {}
+            self.nbrs_ress[nbrs_id] = {}
+            self.nbrs_origins[nbrs_id] = {} 
+            self.nbrs_maps[nbrs_id] = {}
+            breakpts = self.nbrs_parts[nbrs_id]
+            # one map is constructed per NBRS part
+            for part_ix, part_id in zip(breakpts, range(len(breakpts))):
+                part_vxs = nbrs_vxs[part_ix[0]:part_ix[1]]
+                subcloud = subclouds[part_id][:,:3]
+                ahn_tree = cKDTree(subcloud[:,:2])
+                ahn_tree_len = ahn_tree.n
+                # the region of interest is defined as a polygon
+                # buffered from the NBRS (the centreline)
+                roi = LineString(part_vxs).buffer(self.thres + 2)
+                roi_path = mpl.path.Path(roi.exterior.coords[:])
+                nwb_tree = cKDTree(part_vxs[:,:2])
+                # define the raster dimensions based on the
+                # dimensions of the subcloud
+                extents = ((min(subcloud[:,0]), max(subcloud[:,0])),
+                           (min(subcloud[:,1]), max(subcloud[:,1])))
+                res = (round((extents[0][1] - extents[0][0]) / size),
+                       round((extents[1][1] - extents[1][0]) / size))
+                orig = (sum(extents[0]) / 2 - (size / 2) * res[0],
+                        sum(extents[1]) / 2 - (size / 2) * res[1])
+                self.nbrs_extents[nbrs_id][part_id] = extents
+                self.nbrs_ress[nbrs_id][part_id] = res
+                self.nbrs_origins[nbrs_id][part_id] = orig
+                # define a flattened array of pixel centre points
+                ctr_xs = np.linspace(orig[0], orig[0] + res[0] * size,
+                                     res[0]) + size / 2
+                ctr_ys = np.linspace(orig[1], orig[1] + res[1] * size,
+                                     res[1]) + size / 2
+                pix_xs, pix_ys = np.meshgrid(ctr_xs, ctr_ys)
+                ctrs = np.c_[pix_xs.ravel(), pix_ys.ravel()]
+                # mask out all pixels that are not relevant to the
+                # subcloud to reduce computational complexity
+                mask = roi_path.contains_points(ctrs)
+                # fetch the Lidar points close to pixel centres and
+                # NWB vertices (including densified ones)
+                _, pix_ixs = ahn_tree.query(ctrs[mask], 15,
+                                            distance_upper_bound = 2 * size,
+                                            workers = -1)
+                _, nwb_ixs = ahn_tree.query(part_vxs[:,:2], 15,
+                                            distance_upper_bound = 2 * size,
+                                            workers = -1)
+                pix_pts = [subcloud[pt_ixs[pt_ixs != ahn_tree_len]] for
+                           pt_ixs in pix_ixs]
+                nwb_pts = [subcloud[pt_ixs[pt_ixs != ahn_tree_len]] for
+                           pt_ixs in nwb_ixs]
+                # link pixels to the closest NWB vertex
+                pix_nwb = np.array([nwb_tree.query(ctr)[1]
+                                    for ctr in ctrs[mask]])
+                # mask out pixels where there were very few points
+                # in the neighbourhood
+                pix_nwb_mask = [True if len(nwb_pts[ix]) > 2 else False
+                                for ix in pix_nwb]
+                pix_pts_mask = [True if len(pts) > 2 and valid_nwb else False
+                                for pts, valid_nwb
+                                in zip(pix_pts, pix_nwb_mask)]
+                # only the code is left uncommented below that generates
+                # a single normal vector (based on its Lidar neighbourhood) -
+                # in this release the program only generates one
+                # attractor map, which contains kernel-based normal
+                # vector inner products - the rest of the maps are not
+                # used, because they were all significantly poorer in
+                # terms of how they described smoothness contrast
+                """nwb_pts_mask = [True if len(pts) > 2 else False
+                                for pts in nwb_pts]
+                pix_nwb = pix_nwb[pix_nwb_mask]"""
+                pix_pts = [pts for pts, get
+                           in zip(pix_pts, pix_pts_mask) if get]
+                """nwb_pts = [pts if get else None
+                           for pts, get in zip(nwb_pts, nwb_pts_mask)]"""
+                mask[mask == True] = np.array(pix_pts_mask)
+                """pix_vars = np.array([np.var(pts[:,2]) for pts in pix_pts])
+                nwb_vars = np.array([np.var(pts[:,2])
+                                     if pts is not None else None
+                                     for pts in nwb_pts])
+                pix_nwb_vars = np.array([nwb_vars[ix] for ix in pix_nwb])
+                pix_nwb_dvars = np.array([abs(pix_var - nwb_var)
+                                          for pix_var, nwb_var
+                                          in zip(pix_vars, pix_nwb_vars)])"""
+                pix_norms = np.array([lib_shared.planefit_lsq(pts)[1]
+                                      for pts in pix_pts])
+                """nwb_norms = [lib_shared.planefit_lsq(pts)[1]
+                             if pts is not None else None
+                             for pts in nwb_pts]
+                pix_nwb_norms = np.array([nwb_norms[ix] for ix in pix_nwb])
+                pix_nwb_dots = np.array([np.dot(pix_norm, nwb_norm)
+                                         for pix_norm, nwb_norm
+                                         in zip(pix_norms, pix_nwb_norms)])"""
+                # the code below is a single iteration that computes
+                # the kernel-based normal vector inner products in the
+                # raster - pairwise normal vector compinations in the
+                # kernel pixels are considered, but only a random subset
+                # are actually dotted together to increase performance
+                temp = np.full((res[0] * res[1], 3), np.NaN)
+                if temp[mask].shape != pix_norms.shape: continue
+                temp[mask] = pix_norms
+                pix_norms_raster = np.array(np.split(temp, res[1]))
+                mask_raster = np.array(np.split(mask, res[1]))
+                kernel_shape = 4, 4
+                kernel_grid = np.meshgrid(range(kernel_shape[0]),
+                                          range(kernel_shape[1]))
+                kernel_template = np.dstack(kernel_grid).reshape(-1, 2)
+                pix_kernel_dots = []
+                for yi in range(res[1]):
+                    for xi in range(res[0]):
+                        if not mask_raster[yi, xi]: continue
+                        kernel = np.c_[kernel_template[:,0] - 1 + xi,
+                                       kernel_template[:,1] - 1 + yi]
+                        kernel = kernel[(kernel[:,0] > 0)
+                                        & (kernel[:,0] > 0)]
+                        kernel = kernel[(kernel[:,0] < res[0])
+                                        & (kernel[:,1] < res[1])]
+                        norms = pix_norms_raster[(kernel[:,1], kernel[:,0])]
+                        norms = norms[~np.isnan(norms[:,0])]
+                        if len(norms) > 5:
+                            pair_mg = np.meshgrid(range(len(norms)),
+                                                  range(len(norms)))
+                            pair_ixs = np.dstack(pair_mg).reshape(-1, 2)
+                            pair_ixs = pair_ixs[::len(pair_ixs) // 20]
+                            pair_ixs = pair_ixs[pair_ixs[:,0] != pair_ixs[:,1]]
+                            pairs = norms[pair_ixs,]
+                            dots = np.array([np.dot(v0, v1)
+                                             for v0, v1 in pairs])
+                        else: dots = np.array([])
+                        dots = dots[~np.isnan(dots)]
+                        if len(dots) > 0: pix_kernel_dots += [np.median(dots)]
+                        else: pix_kernel_dots += [None]
+                img = np.full(len(mask), np.NaN)
+                img[mask] = pix_kernel_dots
+                img = np.array(np.split(img, res[1]))
+                self.nbrs_maps[nbrs_id][part_id] = img
+                # the preliminary edges are converted to
+                # use image coordinates rather than the real CRS
+                part_edges = edges[edges['PART_ID'] == part_id]
+                edge_l = part_edges[part_edges['SIDE'] == 'left']
+                edge_r = part_edges[part_edges['SIDE'] == 'right']
+                edge_l = np.array(edge_l['geometry'].iloc[0].coords[:])
+                edge_r = np.array(edge_r['geometry'].iloc[0].coords[:])
+                edge_l = np.flip((edge_l[:,:2] - orig) / size, axis = 1)
+                edge_r = np.flip((edge_r[:,:2] - orig) / size, axis = 1)
+                # scikit does not have a concept of no-data pixels, so the
+                # "neutral" value of 1 is used instead
+                img_nonan = img.copy(); img_nonan[np.isnan(img_nonan)] = 1
+                # the left and right NBRS edges are optimised separately
+                snake_l = active_contour(img_nonan, edge_l, coordinates = 'rc',
+                                         alpha = a, beta = b, gamma = g,
+                                         w_line = w_l, w_edge = w_e,
+                                         max_iterations = max_iter,
+                                         boundary_condition = 'fixed')
+                snake_r = active_contour(img_nonan, edge_r, coordinates = 'rc',
+                                         alpha = a, beta = b, gamma = g,
+                                         w_line = w_l, w_edge = w_e,
+                                         max_iterations = max_iter,
+                                         boundary_condition = 'fixed')
+                # the optimised edges are converted back into the
+                # real-life CRS, are combined into a single Polygon
+                snake_l = np.flip(snake_l, axis = 1) * size + orig
+                snake_r = np.flip(snake_r, axis = 1) * size + orig
+                contour = np.concatenate((snake_l, np.flip(snake_r, axis = 0)))
+                contours['NBRS_ID'] += [nbrs_id]
+                contours['PART_ID'] += [part_id]
+                contours['geometry'] += [Polygon(contour)]
+        # the optimised edges are saved into a class-level GeoDataFrame
+        self.nbrs_contours = gpd.GeoDataFrame(contours, crs = "EPSG:28992")
+        print('FINISHED EDGE OPTIMISATION')
+
+    def build_tin(self,
+                  max_dh_int, max_angle_int, r_int,
+                  max_dh_ext, max_angle_ext, r_ext,
+                  ext_steps, ext_dist,
+                  type_edges = 'optimised',
+                  chosen = None):
+        """The TINs describing the surfaces of NBRS roads can either
+        be constructed from the optimised edges, or simply from the
+        preliminary edges. This method makes preparations to call
+        lib_shared.utility_tin() once to construct an initial,
+        conservative surface for the NBRS and then multiple times
+        to gradually extend the surface beyond the boundary defined
+        by the NBRS edges. This is intended to make it possible to
+        include parts of road surfaces that were not detected by
+        preliminary edge construction / active contour optimisation,
+        but it is optional and the user should be aware that it
+        may cause the inclusion of off-road points depending on the
+        local distribution of points, and the closeness of the
+        centreline to the real-life edges of the road surface.
+        The TIN is constructed using a workflow inspired by
+        ground filtering algorithms. The arguments are:
+        - 'max_dh': maximum elevation difference threshold when
+                    inserting a point into the TIN, the difference is
+                    measured between the TIN-projected elevation of
+                    the candidate point, and its own elevation
+        - 'max_angle': maximum angle threshold when inserting a point
+                       into the TIN - the angle is measured between
+                       the triangle into which the point would be
+                       inserted, and the three lines between the point
+                       and the three vertices of the triangle
+        - '_int' and '_ext' at the end of these variables indicates
+           whether they will be taken into account during the initial
+           TIN construction step, or the incremental TIN extension
+        - 'ext_steps': the number of times the extension boundary
+                       should be grown (buffered), in turn the
+                       maximum number of iterations that will be
+                       attempted when extending the TIN
+        - 'ext_dist': the distance (in metres) that the extension
+                      boundary should be buffered by in each
+                      extension iteration
+        - 'type_edges': whether to use 'preliminary' or 'optimised'
+                        edges as the basis for the initial TIN
+                        construction step (before extension)
+        - 'chosen': allows the user to specify a single NBRS ID and
+                    run the code for that NBRS only - may be useful
+                    for testing parametrisation, etc.
+        """
+        if type_edges == 'optimised' and self.nbrs_contours.empty:
+            print('Contour optimisation first needs to be run.'); return
+        if type_edges == 'preliminary' and self.nbrs_edges.empty:
+            print('Preliminary edges first need to be generated.'); return
+        print('\nSTARTING TIN CONSTRUCTION')
+        for nbrs_id in self.get_ids():
+            subclouds = self.nbrs_subclouds[nbrs_id]
+            # special case: NBRS has no subclouds
+            if (chosen is not None and nbrs_id != chosen) or not subclouds:
+                continue
+            edges = self.nbrs_edges[self.nbrs_edges['NBRS_ID'] == nbrs_id]    
+            self.nbrs_tins[nbrs_id] = {}
+            breakpts = self.nbrs_parts[nbrs_id]
+            # a separate TIN will be constructed for each NBRS part
+            for part_ix, part_id in zip(breakpts, range(len(breakpts))):
+                subcloud = subclouds[part_id][:,:3]
+                # create seed points for conditional TIN insertions as
+                # an approximation of the "skeleton" of the surface
+                # (based on the preliminary or optimised edges)
+                part_edges = edges[edges['PART_ID'] == part_id]
+                if part_edges.empty: continue
+                edge_l = part_edges[part_edges['SIDE'] == 'left']
+                edge_r = part_edges[part_edges['SIDE'] == 'right']
+                edge_l = np.array(edge_l['geometry'].iloc[0].coords[:])
+                edge_r = np.array(edge_r['geometry'].iloc[0].coords[:])
+                if type_edges == 'optimised':
+                    ctr = self.nbrs_contours[
+                            (self.nbrs_contours['NBRS_ID'] == nbrs_id)
+                             & (self.nbrs_contours['PART_ID'] == part_id)]
+                    if ctr.empty: continue
+                    ctr = np.array(ctr.values[0][2].exterior.coords[:])
+                else:
+                    ctr = np.concatenate((edge_l,
+                                          np.flip(edge_r, axis = 0)))[:,:2]
+                int_seeds = [(p0 + p1) / 2 for p0, p1 in zip(edge_l, edge_r)]
+                int_seeds = lib_shared.densify_lstr(LineString(int_seeds),
+                                                    self.thres)[0].coords[:]
+                # mask out Lidar points that will not be considered based
+                # on the parametrisation
+                max_extend = 1 + ext_dist * (ext_steps + 1)
+                max_bounds = LineString(int_seeds).buffer(max_extend)
+                all_coords = max_bounds.exterior.coords[:]
+                all_path = mpl.path.Path(all_coords)
+                all_mask = all_path.contains_points(subcloud[:,:2])
+                all_pts = subcloud[all_mask]
+                # select the Lidar points that will be needed for the
+                # construction of the conservative surface -
+                # this means all points within the NBRS edges
+                int_path = mpl.path.Path(ctr)
+                int_mask = int_path.contains_points(all_pts[:,:2])
+                int_pts = [tuple(spt) for spt in all_pts[int_mask]]
+                int_bounds = np.c_[ctr, np.zeros(len(ctr))]
+                # construct the conservative (initial) surface
+                # the actual conditional TIN construction code is
+                # found in lib_shared.utility_tin()
+                pts_inserted = lib_shared.utility_tin(int_pts, int_bounds,
+                                                      max_dh_int, max_angle_int,
+                                                      r_int, None, int_seeds)
+                if not pts_inserted: continue
+                # prepare for iterative extension of the TIN surface
+                prev_bounds = LineString(int_seeds).buffer(1)
+                init_coords = prev_bounds.exterior.coords[:]
+                init_path = mpl.path.Path(init_coords)
+                init_mask = init_path.contains_points(all_pts[:,:2])
+                init_pts = set([tuple(spt) for spt in all_pts[init_mask]])
+                # keep track of which points should no longer be considered,
+                # either because they have already been tested in a previous
+                # iteration, or because they are already part of the TIN
+                excluded_pts = init_pts | set(pts_inserted)
+                # the iteration below calls lib_shared.utility_tin()
+                # each time, but with a different insertion parametrisation,
+                # and with a boundary that is incrementally buffered from
+                # the NWB centreline - the seeds are, in each iteration,
+                # the points from the boundary used in the *previous*
+                # iteration of the for loop
+                for extend in np.arange(ext_dist,
+                                        ext_dist * (ext_steps + 1),
+                                        ext_dist):
+                    ext_coords = prev_bounds.exterior.coords[:]
+                    ext_seeds = np.c_[ext_coords,
+                                      np.zeros(len(ext_coords))].tolist()
+                    prev_bounds = prev_bounds.buffer(extend)
+                    ext_coords = prev_bounds.exterior.coords[:]
+                    ext_bounds = np.c_[ext_coords,
+                                       np.zeros(len(ext_coords))].tolist()
+                    ext_path = mpl.path.Path(ext_coords)
+                    ext_mask = ext_path.contains_points(all_pts[:,:2])
+                    buffer_pts = set([tuple(spt) for spt in all_pts[ext_mask]])
+                    ext_pts = buffer_pts - excluded_pts 
+                    if not ext_pts: continue
+                    pts_inserted = lib_shared.utility_tin(list(ext_pts),
+                                                          ext_bounds,
+                                                          max_dh_ext,
+                                                          max_angle_ext,
+                                                          r_ext,
+                                                          pts_inserted,
+                                                          ext_seeds)
+                    excluded_pts = excluded_pts | set(pts_inserted) | ext_pts
+                # so far, the TIN has been represented by a list of
+                # point insertion - generate the final TIN here and
+                # save it to the class-level TIN dictionary
+                tin = startin.DT()
+                tin.insert(pts_inserted)
+                self.nbrs_tins[nbrs_id][part_id] = tin
+        print('FINISHED TIN CONSTRUCTION')
+
+    def interpolate_elevations(self):
+        """Interpolation algorithm to compute the final elevations of
+        the NBRS centrelines. The final elevations are interpolated
+        in the TINs that were generated for each NBRS. Since the TINs
+        around NBRS end-points (real-life intersections) will be almost
+        identical for each NBRS concerned, continuity is ensured by
+        enforcing that each intersection is associated with a single
+        elevation value. Keep in mind that this kind of 'snapping' may
+        not work reliably if the Lidar cloud is thinned too aggressively.
+        """
+        if not self.nbrs_tins:
+            print('TINs first need to be constructed.'); return
+        print('\nSTARTING ELEVATION INTERPOLATION')
+        # create and activate the new geometry column
+        self.nwb['geometry_accurateZ'] = None
+        self.set_geocol('geometry_accurateZ')
+        vx_zs, vx_z_origins, first = {}, {}, 0
+        for nbrs_id in self.get_ids():
+            # initialise NBRS data
+            nbrs_vxnos = self.nbrs_vxnos[nbrs_id]
+            last = first + sum(nbrs_vxnos)
+            nbrs_vxs = np.array(self.flat_vxs[first:last])[:,:2]
+            nbrs_vxs_3d = np.c_[np.array(nbrs_vxs), np.zeros(len(nbrs_vxs))]
+            first = last
+            tins = self.nbrs_tins.get(nbrs_id)
+            # special case: NBRS has no TINs
+            if not tins: continue
+            breakpts = self.nbrs_parts[nbrs_id]
+            for part_ix, part_id in zip(breakpts, range(len(breakpts))):
+                part_vxs = nbrs_vxs[part_ix[0]:part_ix[1]]
+                dtb_set = self.nbrs_dtb_ref_sets[nbrs_id][part_id]
+                # fetch the NBRS part's TIN
+                tin = tins.get(part_id)
+                if tin is not None:
+                    # for each NBRS part vertex, interpolate in the TIN
+                    # and indicate whether elevation was influenced by
+                    # DTB or not - also keep track of what elevation
+                    # belongs to which horizontal position in each NBRS
+                    # by using dictionaries
+                    for vx in part_vxs:
+                        xy_id = (*np.round(vx, 1), nbrs_id)
+                        try: z = tin.interpolate_laplace(*np.round(vx, 1))
+                        except: continue
+                        tr, origin = tin.locate(*vx), 'ahn3'
+                        tr_vxs = [tin.get_point(tix) for tix in tr]
+                        for tr_vx in tr_vxs:
+                            if tuple(np.round(tr_vx, 1)) in dtb_set:
+                                origin = 'dtb'; break
+                        vx_zs[xy_id] = z
+                        vx_z_origins[xy_id] = origin
+            # select the final elevation for each NBRS vertex -
+            # if an earlier NBRS already has an elevation for a
+            # certain lateral position and is reasonably close
+            # vertically, then snap current vertex to it and
+            # indicate that this has taken place semantically
+            prev_z = None
+            for vx, i in zip(nbrs_vxs, range(len(nbrs_vxs))):
+                xy = tuple(np.round(vx, 1))
+                z = vx_zs.get((*xy, nbrs_id))
+                if z or prev_z:
+                    for nbrs_idi in self.get_ids()[:nbrs_id]:
+                        zi = vx_zs.get((*xy, nbrs_idi))
+                        zi_o = vx_z_origins.get((*xy, nbrs_idi))
+                        if zi and (z and (abs(zi - z) < 0.5)
+                                   or (prev_z and abs(zi - prev_z)  < 0.3)):
+                            vx_z_origins[(*xy, nbrs_id)] = zi_o + '_snapped'
+                            z = zi; break
+                nbrs_vxs_3d[i, 2] = z; prev_z = z
+            # fill no-data regions with interpolated values using
+            # polynomial fitting - do not touch existing values
+            lib_shared.filter_outliers(nbrs_vxs_3d, 10, False, 1, None, True)
+            nbrs_vx_zs, nbrs_z_origins = {}, {}
+            for vx, i in zip(nbrs_vxs_3d, range(len(nbrs_vxs_3d))):
+                xy = tuple(np.round(vx[:2], 1))
+                nbrs_vx_zs[xy] = vx[2]
+                zo = vx_z_origins.get((*xy, nbrs_id))
+                if not zo: zo = 'polynomial fit'
+                nbrs_z_origins[xy] = zo
+            # we want to write the results in the same format as
+            # the input, so we need to carry over the final elevations
+            # into the original wegvakken of the input tile -
+            # for each wegvak of the NBRS, fetch its final elevations
+            # per vertex and update its class geometry at the end
+            for wvk_id in self.nbrs_wvkn[nbrs_id]:
+                wvk_vxs = np.array(self.get_wvk_geom(wvk_id).coords[:])[:,:2]
+                wvk_vxs_3d = np.c_[wvk_vxs, np.zeros(len(wvk_vxs))]
+                self.wvk_z_origins[wvk_id] = []
+                for vx, i in zip(wvk_vxs, range(len(wvk_vxs))):
+                    xy = tuple(np.round(vx, 1))
+                    wvk_vxs_3d[i, 2] = nbrs_vx_zs[xy]
+                    self.wvk_z_origins[wvk_id] += [nbrs_z_origins[xy]]
+                self.set_wvk_geom(wvk_id, LineString(wvk_vxs_3d))
+        print('FINISHED ELEVATION INTERPOLATION')
 
 # testing configuration, only runs when script is not imported
 if __name__ == '__main__':
-    nwb_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_nwb_2.shp'
+    
+    """nwb_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_nwb_2.shp'
     dtb_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_dtb.shp'
     ahn_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_2_26_clipped.las'
     simpleZ_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_simpleZ.shp'
     subclouds_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_subclouds.las'
     edges_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_edges.shp'
-    crosses_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_crosses.shp'
+    crosses_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_crosses.shp'"""
+    
+    nwb_fpath = 'E://Quarter5//Dissertation//ahn3//C_39CZ1_nwb_2.shp'
+    dtb_fpath = 'E://Quarter5//Dissertation//ahn3//C_39CZ1_dtb.shp'
+    ahn_fpath = 'E://Quarter5//Dissertation//ahn3//C_39CZ1_2_26_clipped.las'
+    simpleZ_fpath = 'E://Quarter5//Dissertation//test_outputs//C_39CZ1_simpleZ.shp'
+    subclouds_fpath = 'E://Quarter5//Dissertation//test_outputs//C_39CZ1_subclouds.las'
+    edges_fpath = 'E://Quarter5//Dissertation//test_outputs//C_39CZ1_edges.shp'
+    crosses_fpath = 'E://Quarter5//Dissertation//test_outputs//C_39CZ1_crosses.shp'
+    conts_fpath = 'E://Quarter5//Dissertation//test_outputs//C_39CZ1_conts.shp'
+    maps_fpath = 'E://Quarter5//Dissertation//test_outputs//C_39CZ1_map'
+    tin_fpath = 'E://Quarter5//Dissertation//test_outputs//C_39CZ1_tin'
+    accurateZ_fpath = 'E://Quarter5//Dissertation//test_outputs//C_39CZ1_accurateZ.shp'
+    
     roads = nbrs_manager(nwb_fpath)
-    roads.generate_nbrs()
-    roads.densify(10)
+    roads.generate_nbrs('geometric')
+    roads.densify(5)
     roads.estimate_elevations(ahn_fpath)
     roads.write_all(simpleZ_fpath)
-    roads.segment_lidar(dtb_fpath)
+    roads.segment_lidar(dtb_fpath, 10)
     roads.write_subclouds(subclouds_fpath)
-    roads.estimate_edges()
+    roads.estimate_edges(3.5, 7, 1, 0.4)
     roads.write_edges(edges_fpath, crosses_fpath)
-    #roads.plot(1, True)
-    #roads.plot_all()
+    roads.optimise_edges(0.5,
+                         a = 0, b = 0.01, g = 0.005,
+                         w_l = 0.05, w_e = 1,
+                         max_iter = 1000)
+    roads.write_maps(maps_fpath)
+    roads.write_contours(conts_fpath)
+    roads.build_tin(max_dh_int = 0.1, max_angle_int = 0.12, r_int = 1,
+                    max_dh_ext = 0.03, max_angle_ext = 0.04, r_ext = 0.8,
+                    ext_steps = 5, ext_dist = 0.5,
+                    type_edges = 'preliminary')
+    roads.write_tins(tin_fpath)
+    roads.interpolate_elevations()
+    roads.write_all(accurateZ_fpath,
+                    to_drop = ['geometry', 'geometry_simpleZ'])
+    """roads.write_tin(tin_fpath, 0)
+    roads.plot(1, True)
+    #roads.plot_all()"""
