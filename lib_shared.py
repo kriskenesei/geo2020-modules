@@ -19,7 +19,7 @@ def calc_angle(v0, v1):
     """Computes the angle between two vectors.
     """
     v0, v1 = v0 / np.linalg.norm(v0), v1 / np.linalg.norm(v1)
-    return np.arccos(np.dot(v0, v1))
+    return np.arccos(np.round(np.dot(v0, v1), 8))
 
 def las_reader(fpath, classes = (2, 26)):
     """ Loads the AHN3 tile at the provided file path,
@@ -201,7 +201,7 @@ def filter_outliers(vxs, deg = 6, only_detect = False,
     If interpolation is desired, it uses numpy functions to find
     better values at the locations of outliers, and at locations
     where elevation was missing originally. Edits the input in-place.
-    Arguments:
+    Parameters:
     - 'vxs': the input points as a 3 by 'n' array
     - 'deg': the degree of the polynomial to fit
     - 'only_detect': set to True if a boolean mask is desired

@@ -1427,7 +1427,7 @@ class nbrs_manager:
         local distribution of points, and the closeness of the
         centreline to the real-life edges of the road surface.
         The TIN is constructed using a workflow inspired by
-        ground filtering algorithms. The arguments are:
+        ground filtering algorithms. The parameters are:
         - 'max_dh': maximum elevation difference threshold when
                     inserting a point into the TIN, the difference is
                     measured between the TIN-projected elevation of
@@ -1657,25 +1657,17 @@ class nbrs_manager:
 # testing configuration, only runs when script is not imported
 if __name__ == '__main__':
     
-    """nwb_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_nwb_2.shp'
+    # example file paths - they use the same naming convention
+    # for convenicence, as the uploaded testing data
+    nwb_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_nwb.shp'
     dtb_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_dtb.shp'
     ahn_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_2_26_clipped.las'
     simpleZ_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_simpleZ.shp'
     subclouds_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_subclouds.las'
     edges_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_edges.shp'
-    crosses_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_crosses.shp'"""
-    
-    nwb_fpath = 'E://Quarter5//Dissertation//ahn3//C_39CZ1_nwb_2.shp'
-    dtb_fpath = 'E://Quarter5//Dissertation//ahn3//C_39CZ1_dtb.shp'
-    ahn_fpath = 'E://Quarter5//Dissertation//ahn3//C_39CZ1_2_26_clipped.las'
-    simpleZ_fpath = 'E://Quarter5//Dissertation//test_outputs//C_39CZ1_simpleZ.shp'
-    subclouds_fpath = 'E://Quarter5//Dissertation//test_outputs//C_39CZ1_subclouds.las'
-    edges_fpath = 'E://Quarter5//Dissertation//test_outputs//C_39CZ1_edges.shp'
-    crosses_fpath = 'E://Quarter5//Dissertation//test_outputs//C_39CZ1_crosses.shp'
-    conts_fpath = 'E://Quarter5//Dissertation//test_outputs//C_39CZ1_conts.shp'
-    maps_fpath = 'E://Quarter5//Dissertation//test_outputs//C_39CZ1_map'
-    tin_fpath = 'E://Quarter5//Dissertation//test_outputs//C_39CZ1_tin'
-    accurateZ_fpath = 'E://Quarter5//Dissertation//test_outputs//C_39CZ1_accurateZ.shp'
+    crosses_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_crosses.shp'
+    tin_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_tin'
+    accurateZ_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_accurateZ.shp'
     
     roads = nbrs_manager(nwb_fpath)
     roads.generate_nbrs('geometric')
@@ -1686,12 +1678,16 @@ if __name__ == '__main__':
     roads.write_subclouds(subclouds_fpath)
     roads.estimate_edges(3.5, 7, 1, 0.4)
     roads.write_edges(edges_fpath, crosses_fpath)
-    roads.optimise_edges(0.5,
+    # active contour optimisation can be achieved using the
+    # code below - this parametrisation works with all testing data
+    """roads.optimise_edges(0.5,
                          a = 0, b = 0.01, g = 0.005,
                          w_l = 0.05, w_e = 1,
                          max_iter = 1000)
     roads.write_maps(maps_fpath)
-    roads.write_contours(conts_fpath)
+    roads.write_contours(conts_fpath)"""
+    # set type_edges to 'optimised' below to use the results of
+    # active contour optimisation in place of preliminary edges
     roads.build_tin(max_dh_int = 0.1, max_angle_int = 0.12, r_int = 1,
                     max_dh_ext = 0.03, max_angle_ext = 0.04, r_ext = 0.8,
                     ext_steps = 5, ext_dist = 0.5,
@@ -1700,6 +1696,7 @@ if __name__ == '__main__':
     roads.interpolate_elevations()
     roads.write_all(accurateZ_fpath,
                     to_drop = ['geometry', 'geometry_simpleZ'])
+    # some further debug commands that might be useful
     """roads.write_tin(tin_fpath, 0)
     roads.plot(1, True)
-    #roads.plot_all()"""
+    roads.plot_all()"""
