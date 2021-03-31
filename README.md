@@ -15,3 +15,5 @@ The files were compressed into a 7-Zip file (not conventional Zip), because of t
 Note that some wegvakken/NBRS in the output may have all-NaN elevations and empty Lidar subclouds. This is due to issues with how the Lidar input files were produced; some NBRS extend beyond the boundaries of the relevant AHN3 tiles and can therefore not be associated with elevations. The issue does not bear relevance to the software's effectiveness.
 
 My focus will now shift to producing the P4 report and working on the accuracy assessment part of the project. It is possible that I will implement some of the accuracy assessment workflows in the `nbrs_manager` class, in which case I will update the repository once more to release these features too.
+
+![Screenshot of preliminary edges in C_37HN2](readme_thumb.png?raw=true "Screenshot of preliminary edges in C_37HN2")
