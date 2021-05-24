@@ -86,10 +86,8 @@ def dist_toplane(pt, d, normal):
 
 def orientation(vx0, vx1, pt):
     """Function to perform an Orientation test.
-    
     Takes three points.
     The Orientation test is relative to the last parameter point.
-    
     Returns the Orientation test result in the following format:
     -1 -- Point is clockwise from the line.
     0  -- Point is collinear with the line.
@@ -102,6 +100,47 @@ def orientation(vx0, vx1, pt):
     if det < 0: return -1
     if det > 0: return 1
     return 0
+
+def calc_M(vx, tr_vxs):
+    """Function to compute the M parameter for the
+    TIN-linear error propagation formula.
+    """
+    x0, y0 = tr_vxs[0][0], tr_vxs[0][1]
+    x1, y1 = tr_vxs[1][0], tr_vxs[1][1]
+    x2, y2 = tr_vxs[2][0], tr_vxs[2][1]
+    L0 = x0 * y1 + x2 * y0 + x1 * y2
+    L1 = x2 * y1 + x0 * y2 + x1 * y0
+    L = L0 - L1
+    a0, a1, a2 = (y1 - y2) / L, (y2 - y0) / L, (y0 - y1) / L
+    b0, b1, b2 = (x2 - x1) / L, (x0 - x2) / L, (x1 - x0) / L
+    c0 = (x1 * y2 - x2 * y1) / L
+    c1 = (x2 * y0 - x0 * y2) / L
+    c2 = (x0 * y1 - x1 * y0) / L
+    tr_mx = np.array([[a0, a1, a2],
+                      [b0, b1, b2],
+                      [c0, c1, c2]])
+    vx_vc = np.array([vx[0], vx[1], 1])
+    m0, m1, m2 = np.dot(vx_vc, tr_mx)
+    return m0 ** 2 + m1 ** 2 + m2 ** 2
+
+def calc_angleComponents(tin, tr):
+    """Function to compute the angle component parameters
+    for the TIN-linear error propagation formula.
+    """
+    # the workflow is based on finding a few neighbouring
+    # triangles, fitting a plane and computing the angles
+    # relative to the plane - much like the workflow used
+    # in my TIN growing iterations
+    trs = [tin.incident_triangles_to_vertex(ix) for ix in tr]
+    init_ixs = set(np.concatenate(trs).flatten())
+    nbr_trs = [tin.incident_triangles_to_vertex(tix)
+               for tix in list(init_ixs)]
+    nbr_ixs = set(np.concatenate(nbr_trs).flatten()) | init_ixs
+    r_vxs = [tin.get_point(tix) for tix in list(nbr_ixs)]
+    d, norm = planefit_lsq(np.array(r_vxs))
+    angle_x = np.arcsin(np.dot(norm, np.array([1, 0, 0])))
+    angle_y = np.arcsin(np.dot(norm, np.array([0, 1, 0])))
+    return abs(angle_x), abs(angle_y)
 
 def get_cross(vx0, vx1, vx2, len_cross, sense):
     """Function to return a "cross-section" at the shared
@@ -233,7 +272,8 @@ def filter_outliers(vxs, deg = 6, only_detect = False,
     # vertex distances
     dsts = np.cumsum(np.sqrt((diffs ** 2).sum(axis = 1)))
     zs_notnan, dsts_notnan = zs[~np.isnan(zs)], dsts[~np.isnan(zs)]
-    coeffs = np.polynomial.polynomial.polyfit(dsts_notnan, zs_notnan, deg)
+    coeffs, _ = np.polynomial.polynomial.polyfit(dsts_notnan, zs_notnan,
+                                                 deg, full = True)
     model_zs = np.polynomial.polynomial.polyval(dsts, coeffs)
     # compute the data-model errors and STD
     errors = np.abs(vxs[:,2] - model_zs); mask = errors.copy()
@@ -247,7 +287,8 @@ def filter_outliers(vxs, deg = 6, only_detect = False,
     # missing, or was identified as an outlier
     if not only_nan: out_ix = (errors > thres) | np.isnan(errors)
     else: out_ix = np.isnan(errors)
-    # if any were found, replace them with interpolated values
+    # if any were found, re-fit model on inliers and
+    # replace them with interpolated values
     if len(out_ix) > 0:
         zs[out_ix] = np.interp(dsts[out_ix], dsts[~out_ix], zs[~out_ix])
         vxs[:,2] = zs
@@ -349,38 +390,49 @@ def utility_tin(pts, bounds, max_dh, max_angle, r,
             # a boundary encompassing all candidate points,
             # this operation is guaranteed to always work
             tri = tin.locate(*pt[:2])
-            # for triangles connected to the boundary,
-            # only consider meaningful points, not the ones
-            # boundary points themselves (which have a constant
-            # elevation of 0)
+            # identify boundary points among the vertices
+            # of the located triangle
             vx_ixs = np.array([tix for tix in tri if tix not in bound_ixs])
             vxs = np.array([tin.get_point(tix) for tix in vx_ixs])
-            dh = None
-            # if candidate is in a triangle defined by 3
-            # pre-existing TIN points, interpolate in the TIN to
-            # get the elevation discrepancy
-            if len(vx_ixs) == 3:
-                dh = abs(pt[2] - tin.interpolate_laplace(*pt[:2]))
-            # if one of the triangle vertices is from the outer
-            # bounds, then compute the elevation difference as the
-            # mean difference relative to the elevations of the
-            # TIN vertices, excluding the boundary vertex
-            # note: this is the only way the algorithm can extend
+            dh, grow = None, False
+            # if the triangle has a boundary vertex among its vertices
+            # then consider the operation a "growing" operation
+            if len(vx_ixs) < 3: grow = True
+            # else, consider it a "growing" operation only, if the
+            # area or the circumference of the triangle indicates
+            # that it probably does not belong to the road surface
+            # (i.e. it has a large area or long circumference)
+            else:
+                cross = np.cross(vxs[1] - vxs[0], vxs[2] - vxs[0])
+                area = dist_topoint([0, 0, 0], cross) / 2
+                a = dist_topoint(vxs[0], vxs[1])
+                b = dist_topoint(vxs[1], vxs[2])
+                c = dist_topoint(vxs[2], vxs[0])
+                if area > 50 or a + b + c > 20: grow = True
+            # if this is not a "growing" operation, interpolate
+            # in the TIN to get the elevation deviation
+            if not grow: dh = abs(pt[2] - tin.interpolate_laplace(*pt[:2]))
+            # if this is a "growing" operation, then compute the
+            # elevation difference as the mean difference relative
+            # to the elevations of the TIN vertices, excluding the
+            # boundary vertex
+            # NOTE: this is the only way the algorithm can grow
             # the TIN beyond the current road surface extents
             elif len(vx_ixs) == 2:
                 trs0 = tin.incident_triangles_to_vertex(vx_ixs[0])
                 trs1 = tin.incident_triangles_to_vertex(vx_ixs[1])
-                init_ixs = np.concatenate((trs0, trs1)).flatten()
+                init_ixs = set(np.concatenate((trs0, trs1)).flatten())
                 nbr_trs = [tin.incident_triangles_to_vertex(tix)
-                           for tix in init_ixs]
-                nbr_ixs = []
-                for nbr_tr in nbr_trs: nbr_ixs += nbr_tr
-                nbr_ixs = set(np.array(nbr_ixs).flatten())
+                           for tix in list(init_ixs)]
+                nbr_ixs = set(np.concatenate(nbr_trs).flatten()) | init_ixs
                 nbr_ixs = nbr_ixs - bound_ixs
+                r_vxs = [tin.get_point(tix) for tix in list(nbr_ixs)]
                 r_vxs = np.array([tin.get_point(tix)
                                   for tix in list(nbr_ixs)])
                 dh = dist_toplane(pt, *planefit_lsq(r_vxs))
-            # (if only one vertex was from the TIN, then skip)
+            # perform the angle test - if the triangle had a boundary
+            # vertex among its vertices, ignore that vertex for the
+            # purposes of the angle test (it is at zero elevation)
             if dh and dh < max_dh:
                 insert = True
                 for vx in vxs:
@@ -391,10 +443,8 @@ def utility_tin(pts, bounds, max_dh, max_angle, r,
                 # and angle tests, then insert into TIN, add to the
                 # buffer and mark as having been used already
                 if insert:
-                    used.add(ix)
-                    buffer += [pt]
-                    tin.insert_one_pt(*pt)
-                    pts_inserted.append(pt)
+                    used.add(ix); buffer += [pt]
+                    tin.insert_one_pt(*pt); pts_inserted.append(pt)
     return pts_inserted
 
 def write_geotiff(raster, origin, size, fpath):
