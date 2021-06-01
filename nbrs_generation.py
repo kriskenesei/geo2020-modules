@@ -1869,11 +1869,6 @@ class nbrs_manager:
                                                      dtype = float)
                 self.wvk_density[wvk_id] = np.array(wvk_density,
                                                     dtype = float)
-    # errs = np.concatenate([roads.wvk_z_errors[key] for key in roads.wvk_z_errors.keys()])
-    # merr = np.mean(errs[~np.isnan(errs)])
-    # dsys = np.concatenate([roads.wvk_density[key] for key in roads.wvk_density.keys()])
-    # mdsy = np.mean(dsys[~np.isnan(dsys)])
-    # len(errs[~np.isnan(errs)]) / len(errs)
                 
         
 # testing configuration, only runs when script is not imported
@@ -1881,33 +1876,22 @@ if __name__ == '__main__':
     
     # example file paths - they use the same naming convention
     # for convenicence, as the uploaded testing data
-    """nwb_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_nwb.shp'
+    nwb_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_nwb.shp'
     dtb_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_dtb.shp'
     ahn_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_2_26_clipped.las'
     simpleZ_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_simpleZ.shp'
     subclouds_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_subclouds.las'
     edges_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_edges.shp'
     crosses_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_crosses.shp'
-    maps_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_map'
-    conts_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_conts.shp'
+    #maps_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_map'
+    #conts_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_conts.shp'
     tin_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_tin'
-    accurateZ_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_accurateZ.shp'"""
-    
-    nwb_fpath = 'E://Quarter5//Dissertation//ahn3//C_25BZ2_nwb_2.shp'
-    dtb_fpath = 'E://Quarter5//Dissertation//ahn3//C_25BZ2_dtb.shp'
-    ahn_fpath = 'E://Quarter5//Dissertation//ahn3//C_25BZ2_2_26_clipped.las'
-    simpleZ_fpath = 'E://Quarter5//Dissertation//test_outputs//C_25BZ2_simpleZ.shp'
-    subclouds_fpath = 'E://Quarter5//Dissertation//test_outputs//C_25BZ2_subclouds.las'
-    edges_fpath = 'E://Quarter5//Dissertation//test_outputs//C_25BZ2_edges.shp'
-    crosses_fpath = 'E://Quarter5//Dissertation//test_outputs//C_25BZ2_crosses.shp'
-    #maps_fpath = 'E://Quarter5//Dissertation//test_outputs//C_37HN2_map'
-    #conts_fpath = 'E://Quarter5//Dissertation//test_outputs//C_37HN2_conts.shp'
-    tin_fpath = 'E://Quarter5//Dissertation//test_outputs//C_25BZ2_tin'
-    accurateZ_fpath = 'E://Quarter5//Dissertation//test_outputs//C_25BZ2_accurateZ.shp'
+    accurateZ_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_accurateZ.shp'
     
     roads = nbrs_manager(nwb_fpath)
     roads.generate_nbrs('geometric')
     roads.densify(5)
+    #roads.plot_all()
     roads.estimate_elevations(ahn_fpath)
     roads.write_all(simpleZ_fpath)
     roads.segment_lidar(dtb_fpath, 10)
@@ -1933,7 +1917,3 @@ if __name__ == '__main__':
     roads.write_all(accurateZ_fpath,
                     to_drop = ['geometry_simpleZ'])
     roads.generate_theoreticalerrors(0.075, 0.09, 0.1, 0.05, 3, 3)
-    # some further debug commands that might be useful
-    """roads.write_tin(tin_fpath, 0)
-    roads.plot(1, True)
-    roads.plot_all()"""
