@@ -1916,4 +1916,4 @@ if __name__ == '__main__':
     roads.interpolate_elevations()
     roads.write_all(accurateZ_fpath,
                     to_drop = ['geometry_simpleZ'])
-    roads.generate_theoreticalerrors(0.075, 0.09, 0.1, 0.05, 3, 3)
+    roads.generate_theoreticalerrors(0.075, 0.09, 0.1, 0.05, 3, 9)
