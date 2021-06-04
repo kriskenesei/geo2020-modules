@@ -1,9 +1,9 @@
 # Python Repository of GEO2020 Modules
 
-**This Python repo hosts the source code I am working on for my MSc dissertation at the TU Delft (GEO2020).**
-The research proposal (and all reports) are based in [my other GEO2020 repo](https://github.com/kriskenesei/geo2020-tex).
+**This Python repository hosts the final source code related to my MSc thesis at the TU Delft, titled "Constructing a digital 3D road network for The Netherlands".**
+The research proposal and the thesis itself are based in [my LaTeX repository](https://github.com/kriskenesei/geo2020-tex).
 
-All planned features of the software have been implemented and tested, only minor modifications are to be expected until the conclusion of the project. The accuracy assessment workflows are now also part of the published code framework.
+All planned features of the software have been implemented and tested, and the project has been concluded. The final thesis is now available in the LaTeX repository. Only minor modifications or additions are expected to the code from now on.
 
 I packaged most functionality into one "module" called `nbrs_generation.py`. Almost all the features reside in the class `nbrs_manager`, to provide an interface that is easy to get familiar with for potential re-users. A set of processing functions were factored out into `lib_shared.py` to reduce clutter in the main module.
 

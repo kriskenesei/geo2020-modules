@@ -679,7 +679,7 @@ class nbrs_manager:
             self.wvk_origins[wvk_id] = origins
         print('FINISHED NBRS DENSIFICATION')
         
-    def estimate_elevations(self, fpath, thin = 2):
+    def estimate_elevations(self, fpath, r = 1, thin = 2):
         """Produces preliminary elevations for the road network.
         Each NBRS vertex is associated with an elevation based on
         nearby Lidar points. Artefacts due to occlusion are then
@@ -755,7 +755,7 @@ class nbrs_manager:
         lidar_tree = cKDTree(self.ahn3[:,1:3])
         # get all the Lidar points that are very close to NBRS vertices
         print('FINDING NEARBY LIDAR POINTS')
-        nbrs_ix = nbrs_tree.query_ball_tree(lidar_tree, self.thres * 0.2)
+        nbrs_ix = nbrs_tree.query_ball_tree(lidar_tree, r)
         print('ESTIMATING PRELIMINARY ELEVATIONS')
         # initialise new 3D geometry column and activate it
         self.nwb['geometry_simpleZ'] = None
@@ -1888,32 +1888,36 @@ if __name__ == '__main__':
     tin_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_tin'
     accurateZ_fpath = '[PATH_TO_DIRECTORY]//C_39CZ1_accurateZ.shp'
     
-    roads = nbrs_manager(nwb_fpath)
-    roads.generate_nbrs('geometric')
-    roads.densify(5)
+    roads = nbrs_manager(fpath = nwb_fpath)
+    roads.generate_nbrs(algorithm = 'geometric')
+    roads.densify(thres = 5)
     #roads.plot_all()
-    roads.estimate_elevations(ahn_fpath)
-    roads.write_all(simpleZ_fpath)
-    roads.segment_lidar(dtb_fpath, 10)
-    roads.write_subclouds(subclouds_fpath)
-    roads.estimate_edges(3.5, 7, 1, 0.4)
-    roads.write_edges(edges_fpath, crosses_fpath)
+    roads.estimate_elevations(fpath = ahn_fpath, r = 1, thin = 2)
+    roads.write_all(fpath = simpleZ_fpath)
+    roads.segment_lidar(fpath = dtb_fpath, r = 10)
+    roads.write_subclouds(fpath = subclouds_fpath)
+    roads.estimate_edges(min_width = 3.5, max_width = 7,
+                         thres = 1, perc_to_fit = 0.4)
+    roads.write_edges(fpath_edges = edges_fpath,
+                      fpath_crosses = crosses_fpath)
     # active contour optimisation can be achieved using the
     # code below - this parametrisation works with all testing data
-    """roads.optimise_edges(0.5,
-                         a = 0, b = 0.01, g = 0.005,
-                         w_l = 0.05, w_e = 1,
-                         max_iter = 1000)
-    roads.write_maps(maps_fpath)
-    roads.write_contours(conts_fpath)"""
+    """roads.optimise_edges(size = 0.5,
+                            a = 0, b = 0.01, g = 0.005,
+                            w_l = 0.05, w_e = 1,
+                            max_iter = 1000)
+    roads.write_maps(fpath = maps_fpath)
+    roads.write_contours(fpath = conts_fpath)"""
     # set type_edges to 'optimised' below to use the results of
     # active contour optimisation in place of preliminary edges
     roads.build_tin(max_dh_int = 0.1, max_angle_int = 0.12, r_int = 1,
                     max_dh_ext = 0.03, max_angle_ext = 0.04, r_ext = 0.8,
                     ext_steps = 5, ext_dist = 0.5,
                     type_edges = 'preliminary')
-    roads.write_tins(tin_fpath)
+    roads.write_tins(fpath = tin_fpath)
     roads.interpolate_elevations()
-    roads.write_all(accurateZ_fpath,
+    roads.write_all(fpath = accurateZ_fpath,
                     to_drop = ['geometry_simpleZ'])
-    roads.generate_theoreticalerrors(0.075, 0.09, 0.1, 0.05, 3, 9)
+    roads.generate_theoreticalerrors(ahn_zse = 0.075, ahn_hse = 0.09,
+                                     dtb_zse = 0.1, dtb_hse = 0.05,
+                                     r = 3, thres = 3)
