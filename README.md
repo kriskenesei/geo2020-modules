@@ -1,4 +1,4 @@
-# Python Repository of GEO2020 Modules
+# Python Repository of MSc research source code
 
 **This Python repository hosts the final source code related to my MSc thesis at the TU Delft, titled "Constructing a digital 3D road network for The Netherlands".**
 The research proposal and the thesis itself are based in [my LaTeX repository](https://github.com/kriskenesei/geo2020-tex).
