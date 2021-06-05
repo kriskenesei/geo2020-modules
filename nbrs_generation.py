@@ -1918,6 +1918,8 @@ if __name__ == '__main__':
     roads.interpolate_elevations()
     roads.write_all(fpath = accurateZ_fpath,
                     to_drop = ['geometry_simpleZ'])
+    roads.write_origins(fpath = origins_fpath)
     roads.generate_theoreticalerrors(ahn_zse = 0.075, ahn_hse = 0.09,
                                      dtb_zse = 0.1, dtb_hse = 0.05,
                                      r = 3, thres = 3)
+    roads.write_errors(errors_fpath)
