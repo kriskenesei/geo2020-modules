@@ -7,8 +7,7 @@
 
 import numpy as np
 from scipy.spatial import cKDTree
-from shapely.geometry import MultiPoint, LineString, MultiLineString
-from shapely import ops
+from shapely.geometry import LineString
 from laspy.file import File
 import rasterio
 from rasterio.transform import Affine
@@ -174,43 +173,26 @@ def get_cross(vx0, vx1, vx2, len_cross, sense):
     if orientation(vx0, vx1, cross[0]) != sense: return cross[::-1]
     return cross
 
-def densify_lstr(lstr, thres, origins = None):
-    """Densifies an LineString.
+def densify_lstr(lstr, thres, output_origins = False):
+    """Densifies a LineString.
     Calls densify_edge() for each edge.
     Also handles the generation of "origins", a
-    variable that track which vertices came from
+    variable that tracks which vertices came from
     densification, and which ones from NWB.
     """
-    orig_coords = lstr.coords; orig_len = len(orig_coords)
-    i, j = 0, 0
-    while i < orig_len - 1:
-        vxs = orig_coords[i:i+2]
+    vxs, origins, i, = lstr.coords[:], [], 0
+    while i + 2 <= len(vxs):
+        edge = vxs[i:i + 2]
         # start the recursive vertex densification
-        # of the selected edge of the wegvak
-        dense = LineString(densify_edge(vxs, thres))
-        # add the new vertices to the list that
-        # indicates origin, and mark that they
-        # originate from densification
-        diff = len(dense.coords) - 2
-        if origins:
-            origins = origins[:j+1] + ['added'] * diff + origins[j+1:]
-        # special case: wegvak is a single edge
-        if orig_len == 2: lstr = dense
-        else:
-            # patch the densified edge into the original
-            # wegvak (by replacing original edge)
-            split = ops.split(lstr, MultiPoint(vxs))
-            # special case: first edge of wegvak
-            if not i: to_merge = MultiLineString([dense, split[1]])
-            # special case: last edge of wegvak
-            elif i == orig_len - 2:
-                to_merge = MultiLineString([split[0], dense])
-            # general case
-            elif len(split) != 3: return
-            else: to_merge = MultiLineString([split[0],
-                                              dense, split[2]])
-            lstr = ops.linemerge(to_merge)
-        i, j = i + 1, i + diff + 1
+        # of the selected edge of the LineString
+        dense = densify_edge(edge, thres)
+        # add the new vertices to the list that indicates origin,
+        # and mark that they originate from densification
+        origins += ['nwb'] + ['added'] * (len(dense) - 2) + ['nwb']
+        # patch the densified edge into the original LineString
+        vxs = vxs[:i] + dense + vxs[i + 2:]
+        i += len(dense) - 1
+    lstr = LineString(vxs)
     return lstr, origins
 
 def densify_edge(edge, thres):
@@ -222,7 +204,7 @@ def densify_edge(edge, thres):
     # if distance threshold is not respected: split
     if dst > thres:
         pt = tuple(np.mean(edge, axis = 0))
-        edge_0, edge_1 = (edge[0], pt), (pt, edge[1])
+        edge_0, edge_1 = [edge[0], pt], [pt, edge[1]]
         # recursively split first half and second half
         edge_0 = densify_edge(edge_0, thres)
         edge_1 = densify_edge(edge_1, thres)
