@@ -1,3 +1,5 @@
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 # Python repository of MSc research source code
 
 **This Python repository hosts the final source code related to my MSc thesis at the TU Delft, titled "Constructing a digital 3D road network for The Netherlands".**
@@ -15,3 +17,6 @@ The files were compressed into a 7-Zip file (not conventional Zip), because of t
 Note that some LineStrings in the output may have all-NaN elevations and empty Lidar subclouds. This is due to issues with how the Lidar input files were produced; some NBRS extend beyond the boundaries of the relevant AHN3 tiles and can therefore not be associated with elevations. This issue bears no relevance to the implementation's effectiveness.
 
 ![Screenshot of preliminary edges and cross-sections in C_37HN2](readme_thumb.png?raw=true "Screenshot of preliminary edges and cross-sections in C_37HN2")
+
+This work is licensed under an
+[MIT license][https://opensource.org/licenses/MIT].
