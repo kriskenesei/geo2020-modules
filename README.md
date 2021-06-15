@@ -19,4 +19,4 @@ Note that some LineStrings in the output may have all-NaN elevations and empty L
 ![Screenshot of preliminary edges and cross-sections in C_37HN2](readme_thumb.png?raw=true "Screenshot of preliminary edges and cross-sections in C_37HN2")
 
 This work is licensed under an
-[MIT license][https://opensource.org/licenses/MIT].
+[MIT license](https://opensource.org/licenses/MIT).
